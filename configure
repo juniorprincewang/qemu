@@ -456,6 +456,7 @@ supported_cpu="no"
 supported_os="no"
 bogus_os="no"
 malloc_trim=""
+cuda="no"
 
 # parse CC options first
 for opt do
@@ -1374,6 +1375,10 @@ for opt do
   ;;
   --disable-git-update) git_update=no
   ;;
+  --enable-cuda) cuda="yes"
+  ;;
+  --disable-cuda) cuda="no"
+  ;;
   *)
       echo "ERROR: unknown option $opt"
       echo "Try '$0 --help' for more information"
@@ -1631,6 +1636,7 @@ disabled with --disable-FEATURE, default is enabled if available:
   crypto-afalg    Linux AF_ALG crypto backend driver
   vhost-user      vhost-user support
   capstone        capstone disassembler support
+  cuda            cuda 8.0 support
 
 NOTE: The object files are built at the place where configure is launched
 EOF
@@ -4031,6 +4037,13 @@ EOF
     feature_not_found "jemalloc" "install jemalloc devel"
   fi
 fi
+##########################################
+# enable cuda
+if test "$cuda" = "yes" ; then
+  LIBS="-lcrypto -lcuda -lcudart $LIBS"
+  LDFLAGS="-L/usr/local/cuda/lib64 $LDFLAGS"
+  QEMU_CFLAGS="-I/usr/local/cuda/include $QEMU_CFLAGS"
+fi
 
 ##########################################
 # signalfd probe
@@ -5874,6 +5887,7 @@ echo "avx2 optimization $avx2_opt"
 echo "replication support $replication"
 echo "VxHS block device $vxhs"
 echo "capstone          $capstone"
+echo "CUDA 8.0 support      $cuda"
 
 if test "$sdl_too_old" = "yes"; then
 echo "-> Your SDL version is too old - please upgrade to have SDL support"
@@ -5948,6 +5962,10 @@ echo "GIT_SUBMODULES=$git_submodules" >> $config_host_mak
 echo "GIT_UPDATE=$git_update" >> $config_host_mak
 
 echo "ARCH=$ARCH" >> $config_host_mak
+
+if test "$cuda" = "yes" ; then
+  echo "CONFIG_CUDA=y" >> $config_host_mak
+fi
 
 if test "$debug_tcg" = "yes" ; then
   echo "CONFIG_DEBUG_TCG=y" >> $config_host_mak
