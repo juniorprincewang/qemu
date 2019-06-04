@@ -37,7 +37,7 @@
 #include "qemu/range.h"
 #include "hw/virtio/virtio-bus.h"
 #include "qapi/visitor.h"
-
+#define func() printf("[FUNC]%s\n",__FUNCTION__)
 #define VIRTIO_PCI_REGION_SIZE(dev)     VIRTIO_PCI_CONFIG_OFF(msix_present(dev))
 
 #undef VIRTIO_PCI_CONFIG
@@ -1107,6 +1107,7 @@ static const TypeInfo virtio_9p_pci_info = {
     .class_init    = virtio_9p_pci_class_init,
 };
 #endif /* CONFIG_VIRTFS */
+
 
 /*
  * virtio-pci: This is the PCIDevice which has a virtio-pci-bus.
@@ -2322,6 +2323,85 @@ static const TypeInfo virtio_balloon_pci_info = {
     .class_init    = virtio_balloon_pci_class_init,
 };
 
+////////////////////////////////////////////////////////////////////////////////
+/// begin of cuda
+static void virtio_cuda_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
+{
+    func();
+    VirtIOSerialPCI *dev = VIRTIO_CUDA_PCI(vpci_dev);
+    DeviceState *vdev = DEVICE(&dev->vdev);
+    DeviceState *proxy = DEVICE(vpci_dev);
+    char *bus_name;
+
+    if (vpci_dev->class_code != PCI_CLASS_COMMUNICATION_OTHER &&
+        vpci_dev->class_code != PCI_CLASS_DISPLAY_OTHER && /* qemu 0.10 */
+        vpci_dev->class_code != PCI_CLASS_OTHERS) {        /* qemu-kvm  */
+            vpci_dev->class_code = PCI_CLASS_COMMUNICATION_OTHER;
+    }
+
+    /* backwards-compatibility with machines that were created with
+       DEV_NVECTORS_UNSPECIFIED */
+    if (vpci_dev->nvectors == DEV_NVECTORS_UNSPECIFIED) {
+        vpci_dev->nvectors = dev->vdev.serial.max_virtserial_ports + 1;
+    }
+
+    /*
+     * For command line compatibility, this sets the virtio-serial-device bus
+     * name as before.
+     */
+    if (proxy->id) {
+        bus_name = g_strdup_printf("%s.0", proxy->id);
+        virtio_device_set_child_bus_name(VIRTIO_DEVICE(vdev), bus_name);
+        g_free(bus_name);
+    }
+
+    qdev_set_parent_bus(vdev, BUS(&vpci_dev->bus));
+    object_property_set_bool(OBJECT(vdev), true, "realized", errp);
+}
+
+static Property virtio_cuda_pci_properties[] = {
+    DEFINE_PROP_BIT("ioeventfd", VirtIOPCIProxy, flags,
+                    VIRTIO_PCI_FLAG_USE_IOEVENTFD_BIT, true),
+    DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors, 2),
+    DEFINE_PROP_UINT32("class", VirtIOPCIProxy, class_code, 0),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
+static void virtio_cuda_pci_class_init(ObjectClass *klass, void *data)
+{
+    func();
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    VirtioPCIClass *k = VIRTIO_PCI_CLASS(klass);
+    PCIDeviceClass *pcidev_k = PCI_DEVICE_CLASS(klass);
+    k->realize = virtio_cuda_pci_realize;
+    set_bit(DEVICE_CATEGORY_INPUT, dc->categories);
+    dc->props = virtio_cuda_pci_properties;
+    pcidev_k->vendor_id = PCI_VENDOR_ID_REDHAT_QUMRANET;
+    pcidev_k->device_id = PCI_DEVICE_ID_VIRTIO_CUDA;//PCI_DEVICE_ID_VIRTIO_CUDA;
+    pcidev_k->revision = VIRTIO_PCI_ABI_VERSION;
+    pcidev_k->class_id = PCI_CLASS_COMMUNICATION_OTHER;
+}
+
+static void virtio_cuda_pci_instance_init(Object *obj)
+{
+    func();
+    VirtIOSerialPCI *dev = VIRTIO_CUDA_PCI(obj);
+
+    virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
+                                TYPE_VIRTIO_CUDA);
+    func();
+}
+
+static const TypeInfo virtio_cuda_pci_info = {
+    .name          = TYPE_VIRTIO_CUDA_PCI,
+    .parent        = TYPE_VIRTIO_PCI,
+    .instance_size = sizeof(VirtIOSerialPCI),
+    .instance_init = virtio_cuda_pci_instance_init,
+    .class_init    = virtio_cuda_pci_class_init,
+};
+/// end of cuda
+////////////////////////////////////////////////////////////////////////////////
+
 /* virtio-serial-pci */
 
 static void virtio_serial_pci_realize(VirtIOPCIProxy *vpci_dev, Error **errp)
@@ -2671,6 +2751,7 @@ static const TypeInfo virtio_pci_bus_info = {
 
 static void virtio_pci_register_types(void)
 {
+    type_register_static(&virtio_cuda_pci_info);
     type_register_static(&virtio_rng_pci_info);
     type_register_static(&virtio_input_pci_info);
     type_register_static(&virtio_input_hid_pci_info);

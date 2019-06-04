@@ -18,6 +18,8 @@
 #include "qapi/error.h"
 #include "qapi/qapi-events-char.h"
 
+#define func() printf("[FUNC]%s\n",__FUNCTION__)
+
 #define TYPE_VIRTIO_CONSOLE_SERIAL_PORT "virtserialport"
 #define VIRTIO_CONSOLE(obj) \
     OBJECT_CHECK(VirtConsole, (obj), TYPE_VIRTIO_CONSOLE_SERIAL_PORT)
@@ -210,6 +212,7 @@ static void virtconsole_enable_backend(VirtIOSerialPort *port, bool enable)
 
 static void virtconsole_realize(DeviceState *dev, Error **errp)
 {
+    func();
     VirtIOSerialPort *port = VIRTIO_SERIAL_PORT(dev);
     VirtConsole *vcon = VIRTIO_CONSOLE(dev);
     VirtIOSerialPortClass *k = VIRTIO_SERIAL_PORT_GET_CLASS(dev);
@@ -254,6 +257,7 @@ static void virtconsole_unrealize(DeviceState *dev, Error **errp)
 
 static void virtconsole_class_init(ObjectClass *klass, void *data)
 {
+    func();
     VirtIOSerialPortClass *k = VIRTIO_SERIAL_PORT_CLASS(klass);
 
     k->is_console = true;
@@ -272,6 +276,7 @@ static Property virtserialport_properties[] = {
 
 static void virtserialport_class_init(ObjectClass *klass, void *data)
 {
+    func();
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtIOSerialPortClass *k = VIRTIO_SERIAL_PORT_CLASS(klass);
 

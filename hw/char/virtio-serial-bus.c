@@ -29,6 +29,8 @@
 #include "hw/virtio/virtio-serial.h"
 #include "hw/virtio/virtio-access.h"
 
+#define func() printf("[FUNC]%s\n",__FUNCTION__)
+
 static struct VirtIOSerialDevices {
     QLIST_HEAD(, VirtIOSerial) devices;
 } vserdevices;
@@ -845,6 +847,7 @@ static Property virtser_props[] = {
 
 static void virtser_bus_class_init(ObjectClass *klass, void *data)
 {
+    func();
     BusClass *k = BUS_CLASS(klass);
     k->print_dev = virtser_bus_dev_print;
 }
@@ -931,6 +934,7 @@ static void remove_port(VirtIOSerial *vser, uint32_t port_id)
 
 static void virtser_port_device_realize(DeviceState *dev, Error **errp)
 {
+    func();
     VirtIOSerialPort *port = VIRTIO_SERIAL_PORT(dev);
     VirtIOSerialPortClass *vsc = VIRTIO_SERIAL_PORT_GET_CLASS(port);
     VirtIOSerialBus *bus = VIRTIO_SERIAL_BUS(qdev_get_parent_bus(dev));
@@ -1024,6 +1028,7 @@ static void virtser_port_device_unrealize(DeviceState *dev, Error **errp)
 
 static void virtio_serial_device_realize(DeviceState *dev, Error **errp)
 {
+    func();
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
     VirtIOSerial *vser = VIRTIO_SERIAL(dev);
     uint32_t i, max_supported_ports;
@@ -1100,6 +1105,7 @@ static void virtio_serial_device_realize(DeviceState *dev, Error **errp)
 
 static void virtio_serial_port_class_init(ObjectClass *klass, void *data)
 {
+    func();
     DeviceClass *k = DEVICE_CLASS(klass);
 
     set_bit(DEVICE_CATEGORY_INPUT, k->categories);
@@ -1161,6 +1167,7 @@ static Property virtio_serial_properties[] = {
 
 static void virtio_serial_class_init(ObjectClass *klass, void *data)
 {
+    func();
     DeviceClass *dc = DEVICE_CLASS(klass);
     VirtioDeviceClass *vdc = VIRTIO_DEVICE_CLASS(klass);
     HotplugHandlerClass *hc = HOTPLUG_HANDLER_CLASS(klass);

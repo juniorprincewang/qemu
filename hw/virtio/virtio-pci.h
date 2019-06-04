@@ -27,6 +27,7 @@
 #include "hw/virtio/virtio-gpu.h"
 #include "hw/virtio/virtio-crypto.h"
 #include "hw/virtio/vhost-user-scsi.h"
+#include "hw/virtio/virtio-vcuda-bus.h" // add by max
 #if defined(CONFIG_VHOST_USER) && defined(CONFIG_LINUX)
 #include "hw/virtio/vhost-user-blk.h"
 #endif
@@ -46,6 +47,8 @@ typedef struct VirtIOBlkPCI VirtIOBlkPCI;
 typedef struct VirtIOSCSIPCI VirtIOSCSIPCI;
 typedef struct VirtIOBalloonPCI VirtIOBalloonPCI;
 typedef struct VirtIOSerialPCI VirtIOSerialPCI;
+// by max
+typedef struct VirtIOVCudaPCI VirtIOVCudaPCI;
 typedef struct VirtIONetPCI VirtIONetPCI;
 typedef struct VHostSCSIPCI VHostSCSIPCI;
 typedef struct VHostUserSCSIPCI VHostUserSCSIPCI;
@@ -298,6 +301,18 @@ struct VirtIOSerialPCI {
     VirtIOSerial vdev;
 };
 
+/* add by max
+ * virtio-cuda-pci: This extends VirtioPCIProxy.
+ */
+#define TYPE_VIRTIO_CUDA_PCI "virtio-cuda-pci"
+#define VIRTIO_CUDA_PCI(obj) \
+        OBJECT_CHECK(VirtIOSerialPCI, (obj), TYPE_VIRTIO_CUDA_PCI)
+
+struct VirtIOCudaPCI {
+    VirtIOPCIProxy parent_obj;
+    VirtIOSerial vdev;
+};
+
 /*
  * virtio-net-pci: This extends VirtioPCIProxy.
  */
@@ -387,6 +402,8 @@ struct VirtIOGPUPCI {
     VirtIOPCIProxy parent_obj;
     VirtIOGPU vdev;
 };
+
+
 
 #ifdef CONFIG_VHOST_VSOCK
 /*

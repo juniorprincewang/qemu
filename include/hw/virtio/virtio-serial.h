@@ -227,4 +227,8 @@ void virtio_serial_throttle_port(VirtIOSerialPort *port, bool throttle);
 #define VIRTIO_SERIAL(obj) \
         OBJECT_CHECK(VirtIOSerial, (obj), TYPE_VIRTIO_SERIAL)
 
+#define TYPE_VIRTIO_CUDA "virtio-cuda-device"
+#define VIRTIO_CUDA(obj) \
+        OBJECT_CHECK(VirtIOSerial, (obj), TYPE_VIRTIO_CUDA)
+
 #endif
