@@ -436,32 +436,6 @@ static void cuda_register_function(uint8_t *buf, ssize_t len)
     arg->cmd = cudaSuccess;
 }
 
-
-static void cuda_malloc(uint8_t *buf, ssize_t len)
-{
-    func();
-    cudaError_t err;
-    void *devPtr;
-    uint32_t size;
-    VirtIOArg *header = (VirtIOArg*)buf;
-    unsigned int id = get_current_id( (unsigned int)header->tid );
-    // in case cudaReset was the previous call
-    initialize_device(id);
-    size = header->srcSize;
-    cudaError( (err= cudaMalloc(&devPtr, size)));
-    header->dst = (uint64_t)devPtr;
-    header->cmd = err;
-    debug(" devPtr=%lu, size=%d, return value=%d\n", header->dst, size, err);
-    /*
-    cudaError( (err= cudaFree(header->dst)));
-    debug(" free devPtr=%p, return value=%d\n", (void*)(header->dst), err);
-    cudaError( (err= cudaMalloc(&devPtr, size)));
-    header->dst = devPtr;
-    header->cmd = err;
-    debug(" devPtr=%p, size=%d, return value=%d\n", header->dst, size, err);
-    */
-}
-
 static void cuda_configure_call(uint8_t *buf, ssize_t *len)
 {
     func();
@@ -536,56 +510,84 @@ static void cuda_launch(uint8_t *buf, ssize_t *len)
     paraBuf = NULL;
 }
 
-static void cuda_memcpy(uint8_t *buf, ssize_t *len)
+static void cuda_memcpy(uint8_t *buf, ssize_t len)
 {
-    func();
     cudaError_t err;
     uint32_t size;
-    VirtIOArg *header = (VirtIOArg*)buf;
+    VirtIOArg *arg = (VirtIOArg*)buf;
     void *src, *dst;
-    unsigned int id = get_current_id( (unsigned int)header->tid );
+    unsigned int id = get_current_id( (unsigned int)arg->tid );
+    func();
     // in case cudaReset was the previous call
     initialize_device(id);
-    debug("src=%lu, srcSize=%d, dst=%lu, dstSize=%d, kind=%lu\n", \
-        header->src, header->srcSize, header->dst, header->dstSize, header->flag);
-    if (header->flag == cudaMemcpyHostToDevice) {
-        src =(void*)( buf+sizeof(VirtIOArg));
-        dst = (void *)header->dst;
-        size = header->srcSize;
-        // cuError( (err= cuMemcpyHtoD((CUdeviceptr)dst, (CUdeviceptr)src, size)));
+    debug("src=0x%lx, srcSize=%d, dst=9x%lx, dstSize=%d, kind=%lu\n", \
+        arg->src, arg->srcSize, arg->dst, arg->dstSize, arg->flag);
+    size = arg->srcSize;
+    if (arg->flag == cudaMemcpyHostToDevice) {
+        hwaddr src_len = (hwaddr)size;
+        src = cpu_physical_memory_map(arg->src, &src_len, 1);
+        if (!src || src_len != size) {
+            error("Failed to map MMIO memory for"
+                              " gpa 0x%lx element size %u\n",
+                                arg->src, size);
+            return ;
+        }
+        dst = (void *)arg->dst;
         cuError( (err= cuMemcpyHtoD((CUdeviceptr)dst, (void *)src, size)));
-        *len = sizeof(VirtIOArg);
-    } else if (header->flag == cudaMemcpyDeviceToHost) {
-        src = (void *)header->src;
-        size = header->srcSize;
-        dst = (void*)( buf+sizeof(VirtIOArg));
+    } else if (arg->flag == cudaMemcpyDeviceToHost) {
+        src = (void *)(arg->src);
+        hwaddr dst_len = (hwaddr)size;
+        // gpa => hva
+        dst = cpu_physical_memory_map(arg->dst, &dst_len, 1);
+        if (!dst || dst_len != size) {
+            error("Failed to map MMIO memory for"
+                              " gpa 0x%lx element size %u\n",
+                                arg->dst, size);
+            return ;
+        }
         //testOver4K(buf, size);
         cuError( (err=cuMemcpyDtoH((void *)dst, (CUdeviceptr)src, size)) );
-        err = 0;
-    } else if (header->flag == cudaMemcpyDeviceToDevice) {
-        src = (void *)header->src;
-        dst = (void *)header->dst;
-        size = header->srcSize;
+        // err = 0;
+    } else if (arg->flag == cudaMemcpyDeviceToDevice) {
+        src = (void *)(arg->src);
+        dst = (void *)(arg->dst);
         cuError( (err=cuMemcpyDtoD((CUdeviceptr)dst, (CUdeviceptr)src, size)) );
-        *len = sizeof(VirtIOArg);
     }
-    header->cmd = err;
+    arg->cmd = err;
     debug(" return value=%d\n", err);
+}
+
+static void cuda_malloc(uint8_t *buf, ssize_t len)
+{
+    cudaError_t err;
+    void *devPtr;
+    uint32_t size;
+    VirtIOArg *arg = (VirtIOArg*)buf;
+    func();
+
+    unsigned int id = get_current_id( (unsigned int)arg->tid );
+    // in case cudaReset was the previous call
+    initialize_device(id);
+    size = arg->srcSize;
+    cudaError( (err= cudaMalloc(&devPtr, size)));
+    arg->dst = (uint64_t)devPtr;
+    arg->cmd = err;
+    debug(" devPtr=0x%lx, size=%d, return value=%d\n", arg->dst, size, err);
 }
 
 static void cuda_free(uint8_t *buf, ssize_t len)
 {
-    func();
     cudaError_t err;
     void *src;
-    VirtIOArg *header = (VirtIOArg*)buf;
-    unsigned int id = get_current_id( (unsigned int)header->tid );
+    VirtIOArg *arg = (VirtIOArg*)buf;
+    unsigned int id = get_current_id( (unsigned int)arg->tid );
+    func();
+    // in case of cudaReset
     initialize_device(id);
-
-    src = (void*)(header->src);
+    src = (void*)(arg->src);
     cudaError( (err= cudaFree(src)) );
-    header->cmd = err;
-    debug(" ptr = %16p, return value=%d\n", (void*)(header->src), err);
+    arg->cmd = err;
+    debug(" ptr = 0x%lx, return value=%d\n", arg->src, err);
 }
 
 static void cuda_get_device(void *buf, ssize_t len)
@@ -846,7 +848,7 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
             cuda_malloc(out, len);
             break;
         case VIRTIO_CUDA_MEMCPY:
-            cuda_memcpy(out, &len);
+            cuda_memcpy(out, len);
             break;
         case VIRTIO_CUDA_FREE:
             cuda_free(out, len);
