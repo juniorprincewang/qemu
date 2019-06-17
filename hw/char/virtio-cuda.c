@@ -590,31 +590,31 @@ static void cuda_free(uint8_t *buf, ssize_t len)
 
 static void cuda_get_device(void *buf, ssize_t len)
 {
-    func();
     int dev = 0;
-    VirtIOArg *header = (VirtIOArg*)buf;
-    unsigned int id = get_current_id( (unsigned int)header->tid );
+    VirtIOArg *arg = (VirtIOArg*)buf;
+    hwaddr gpa = (hwaddr)(arg->dst);
+    func();
+    unsigned int id = get_current_id( (unsigned int)arg->tid );
     initialize_device(id);
-    header->cmd = cudaSuccess;
+    arg->cmd = cudaSuccess;
     dev = (int)(cudaDevices[cudaDeviceCurrent[id]].device);
-    
-    memcpy(buf+sizeof(VirtIOArg), &dev, header->dstSize);
-    debug("buf+sizeof(VirtIOArg)=%d\n", *(int*)(buf+sizeof(VirtIOArg)));
+    cpu_physical_memory_write(gpa, &dev, sizeof(int));
 }
 
 static void cuda_get_device_properties(void *buf, ssize_t len)
 {
-    func();
     cudaError_t err;
     int devID;
     struct cudaDeviceProp prop;
-    VirtIOArg *header = (VirtIOArg*)buf;
-    devID = (int)(header->flag);
+    VirtIOArg *arg = (VirtIOArg*)buf;
+    hwaddr gpa = (hwaddr)(arg->dst);
+    func();
+    devID = (int)(arg->flag);
     debug("Get prop for device %d\n", devID);
     cudaError( (err=cudaGetDeviceProperties(&prop, devID)) );
     debug("Device %d : \"%s\" with compute %d.%d capability.\n", devID, prop.name, prop.major, prop.minor);
-    header->cmd = err;
-    memcpy(buf+sizeof(VirtIOArg), &prop, header->dstSize);
+    arg->cmd = err;
+    cpu_physical_memory_write(gpa, &prop, arg->dstSize);
 }
 
 static void cuda_set_device(void *buf, ssize_t len)
