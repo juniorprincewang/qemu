@@ -261,15 +261,15 @@ static void* gpa_to_hva(uint64_t pa)
 }
 */
 
-static void load_module_kernels(int devID, void *fatBin, 
+static void load_module_kernel(int devID, void *fatBin, 
                 char *funcName, unsigned int funcID, int funcIndex)
 {
     func();
     debug("Loading module... fatBin=%16p, name=%s, funcID=%d\n", 
             fatBin, funcName, funcID);
     cuError( cuModuleLoadData(&cudaDevices[devID].module, fatBin) );
-    cuError( cuModuleGetFunction(&cudaDevices[devID].
-        cudaFunction[funcIndex], cudaDevices[devID].module, funcName) );
+    cuError( cuModuleGetFunction(&cudaDevices[devID].cudaFunction[funcIndex], \
+        cudaDevices[devID].module, funcName) );
     cudaDevices[devID].cudaFunctionID[funcIndex] = funcID;
     cudaDevices[devID].kernelsLoaded = 1;
 }
@@ -285,7 +285,7 @@ static void reload_all_kernels(unsigned int id)
         fatBin = devicesKernels[i].fatBin;
         functionName = devicesKernels[i].functionName;
         funcID = devicesKernels[i].funcID;
-        load_module_kernels( cudaDeviceCurrent[id], fatBin, 
+        load_module_kernel( cudaDeviceCurrent[id], fatBin, 
                 functionName, funcID, i);
     }
 }
@@ -318,24 +318,46 @@ static unsigned int get_current_id(unsigned int tid)
 {
     return tid%totalDevice;
 }
-
-static void cuda_register_fatbinary(void *buf, ssize_t *len)
+/*
+static void *memdup(const void *src, size_t n)
+{
+    void *dst;
+    dst = malloc(n);
+    if(dst == NULL)
+        return NULL;
+    return memcpy(dst, src, n);
+}
+*/
+static void cuda_register_fatbinary(void *buf, ssize_t len)
 {
     func();
     unsigned int i;
-    void *fatBin;
-    VirtIOArg *header = (VirtIOArg*)buf;
+    void *fat_bin;
+    hwaddr gpa;
+    VirtIOArg *arg = (VirtIOArg*)buf;
+    uint32_t src_size = arg->srcSize;
     // check out hmac
-    fatBin = buf+sizeof(VirtIOArg);
-    debug("fatbin is 0x%lx\n", *(uint64_t*)fatBin);
-    //    fatBinAddr = gpa_to_hva(header->addr1);
-    //  cpu_physical_memory_rws(header->addr1, fatBinAddr, len, 0);
+    gpa = (hwaddr)(arg->src);
+    // try cpu_physical_memory_map next time
+    // fat_bin = malloc(arg->srcSize);
+    // cpu_physical_memory_read(gpa, fat_bin, arg->srcSize);
+    hwaddr src_len = (hwaddr)src_size;
+    fat_bin = cpu_physical_memory_map(gpa, &src_len, 1);
+    if (!fat_bin || src_len != src_size) {
+        error("Failed to map MMIO memory for"
+                          " gpa 0x%lx element size %u\n",
+                            gpa, src_size);
+        return ;
+    }
+    debug("fat_bin is 0x%lx\n", *(uint64_t*)fat_bin);
+    //    fatBinAddr = gpa_to_hva(arg->addr1);
+    //  cpu_physical_memory_rws(arg->addr1, fatBinAddr, len, 0);
     //  fatBinAddr = malloc(len);
 
-    //assert(*(uint64_t*)fatBin ==  *(uint64_t*)fatBinAddr);
+    //assert(*(uint64_t*)fat_bin ==  *(uint64_t*)fatBinAddr);
     /* check binary
-    if(0==check_hmac(fatBin, header->srcSize)) {
-        header->cmd = cudaErrorMissingConfiguration;
+    if(0==check_hmac(fat_bin, arg->srcSize)) {
+        arg->cmd = cudaErrorMissingConfiguration;
         return ;
     }
     */
@@ -359,51 +381,13 @@ static void cuda_register_fatbinary(void *buf, ssize_t *len)
     cudaDeviceCurrent[0] = cudaDevices[0].device;
     cudaEventNum = 0;
     cudaStreamNum = 0;
-    header->cmd = cudaSuccess;
-    *len = sizeof(VirtIOArg);
+    arg->cmd = cudaSuccess;
 }
 
-static void cuda_register_function(uint8_t *buf, ssize_t *len)
-{
-    func();
-    void *fatBin;
-    uint8_t *funcName;
-    uint32_t funcID;
-    int fatSize=0;
-    VirtIOArg *header = (VirtIOArg*)buf;
-    // unsigned int id = get_current_id( (unsigned int)header->tid );
-    
-    fatBin = buf+sizeof(VirtIOArg);
-    funcName = buf+sizeof(VirtIOArg)+header->srcSize;
-    funcID = header->flag;
-    // initialize the KernelInfo
-    // fatSize = next_p2(header->srcSize);
-    fatSize = header->srcSize;
-    // malloc 最大申请可达到4G内存，应该够用了
-    devicesKernels[cudaFunctionNum].fatBin = malloc(fatSize);
-    memcpy(devicesKernels[cudaFunctionNum].fatBin, fatBin, fatSize);
-    memcpy(devicesKernels[cudaFunctionNum].functionName, funcName, header->dstSize);
-    devicesKernels[cudaFunctionNum].funcID = funcID;
-    debug("fatBin = %16p, name='%s', cudaFunctionNum = %d\n", 
-        fatBin, (char*)funcName, cudaFunctionNum);
-    /*
-    int i= totalDevice;
-    while(i-- != 0)
-    {
-        load_module_kernels(i, fatBin, funcName, funcID, cudaFunctionNum);
-    }
-    */
-    load_module_kernels(cudaFunctionNum, fatBin, (char*)funcName, funcID, cudaFunctionNum);
-    cudaFunctionNum++;
-    debug(" total Device =%d, cudaFunction=%d\n", totalDevice, funcID);
-    header->cmd = cudaSuccess;
-    *len = sizeof(VirtIOArg);
-    //cudaError( (global_err = cudaStreamCreate(&cudaStream[0])) );
-}
-
-static void cuda_unregister_fatinary(void)
+static void cuda_unregister_fatinary(void *buf, ssize_t len)
 {
     int i;
+    VirtIOArg *arg = (VirtIOArg*)buf;
     func();
     for(i=0; i<totalDevice; i++) {
         if ( memcmp(&zeroedDevice, &cudaDevices[i], sizeof(CudaDev)) != 0 )
@@ -412,7 +396,46 @@ static void cuda_unregister_fatinary(void)
         memset(devicesKernels[i].functionName, 0, sizeof(devicesKernels[i].functionName));
     }
     free(cudaDevices);
+    arg->cmd = cudaSuccess;
 }
+
+static void cuda_register_function(uint8_t *buf, ssize_t len)
+{
+    hwaddr fat_bin_gpa;
+    hwaddr func_name_gpa;
+    uint32_t func_id;
+    uint32_t fat_size, name_size;
+    VirtIOArg *arg = (VirtIOArg*)buf;
+    func();
+
+    fat_bin_gpa = (hwaddr)(arg->src);
+    func_name_gpa = (hwaddr)(arg->dst);
+    func_id = arg->flag;
+    fat_size = arg->srcSize;
+    name_size = arg->dstSize;
+    // initialize the KernelInfo
+    // fatSize = next_p2(header->srcSize);
+    // malloc 最大申请可达到4G内存，应该够用了
+    devicesKernels[cudaFunctionNum].fatBin = malloc(fat_size);
+
+    cpu_physical_memory_read(fat_bin_gpa, \
+        devicesKernels[cudaFunctionNum].fatBin, fat_size);
+    cpu_physical_memory_read(func_name_gpa, \
+        devicesKernels[cudaFunctionNum].functionName, name_size);
+
+    devicesKernels[cudaFunctionNum].funcID = func_id;
+    debug("fatBin = %16p, name='%s', cudaFunctionNum = %d\n", 
+        devicesKernels[cudaFunctionNum].fatBin, \
+        (char*)devicesKernels[cudaFunctionNum].functionName, \
+        cudaFunctionNum);
+    load_module_kernel(cudaFunctionNum, \
+        devicesKernels[cudaFunctionNum].fatBin, \
+        (char*)devicesKernels[cudaFunctionNum].functionName, \
+        func_id, cudaFunctionNum);
+    cudaFunctionNum++;
+    arg->cmd = cudaSuccess;
+}
+
 
 static void cuda_malloc(uint8_t *buf, ssize_t len)
 {
@@ -426,9 +449,9 @@ static void cuda_malloc(uint8_t *buf, ssize_t len)
     initialize_device(id);
     size = header->srcSize;
     cudaError( (err= cudaMalloc(&devPtr, size)));
-    header->dst = devPtr;
+    header->dst = (uint64_t)devPtr;
     header->cmd = err;
-    debug(" devPtr=%p, size=%d, return value=%d\n", header->dst, size, err);
+    debug(" devPtr=%lu, size=%d, return value=%d\n", header->dst, size, err);
     /*
     cudaError( (err= cudaFree(header->dst)));
     debug(" free devPtr=%p, return value=%d\n", (void*)(header->dst), err);
@@ -523,25 +546,25 @@ static void cuda_memcpy(uint8_t *buf, ssize_t *len)
     unsigned int id = get_current_id( (unsigned int)header->tid );
     // in case cudaReset was the previous call
     initialize_device(id);
-    debug("src=%p, srcSize=%d, dst=%p, dstSize=%d, kind=%lu\n", \
+    debug("src=%lu, srcSize=%d, dst=%lu, dstSize=%d, kind=%lu\n", \
         header->src, header->srcSize, header->dst, header->dstSize, header->flag);
     if (header->flag == cudaMemcpyHostToDevice) {
         src =(void*)( buf+sizeof(VirtIOArg));
-        dst = header->dst;
+        dst = (void *)header->dst;
         size = header->srcSize;
         // cuError( (err= cuMemcpyHtoD((CUdeviceptr)dst, (CUdeviceptr)src, size)));
         cuError( (err= cuMemcpyHtoD((CUdeviceptr)dst, (void *)src, size)));
         *len = sizeof(VirtIOArg);
     } else if (header->flag == cudaMemcpyDeviceToHost) {
-        src = header->src;
+        src = (void *)header->src;
         size = header->srcSize;
         dst = (void*)( buf+sizeof(VirtIOArg));
         //testOver4K(buf, size);
         cuError( (err=cuMemcpyDtoH((void *)dst, (CUdeviceptr)src, size)) );
         err = 0;
     } else if (header->flag == cudaMemcpyDeviceToDevice) {
-        src = header->src;
-        dst = header->dst;
+        src = (void *)header->src;
+        dst = (void *)header->dst;
         size = header->srcSize;
         cuError( (err=cuMemcpyDtoD((CUdeviceptr)dst, (CUdeviceptr)src, size)) );
         *len = sizeof(VirtIOArg);
@@ -781,7 +804,7 @@ static void cuda_gpa_to_hva(void *buf, ssize_t len)
     debug("a=%d\n", a);
     a++;
     cpu_physical_memory_write(gpa, &a, sizeof(int));
-    arg->cmd = (int32_t)cudaSuccess;
+    arg->cmd = 1;//(int32_t)cudaSuccess;
 }
 
 /* 
@@ -792,7 +815,7 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
 {
     ssize_t ret;
     VirtIOArg header;
-    uint8_t *out;
+    void *out;
     func();
 
     debug("port->id=%d, buf=%6s, len=%ld\n", port->id, buf, len);
@@ -801,20 +824,21 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
     memcpy((void *)out, (void *)buf, len);
     debug("[+] header.cmd=%u, nr= %u \n", \
         header.cmd, _IOC_NR(header.cmd));
-    debug("[+] header.tid = %d (0x%x)\n", header.tid, header.tid);
+    debug("[+] header.tid = %d\n", header.tid);
     switch(header.cmd) {
         case VIRTIO_CUDA_HELLO:
             cuda_gpa_to_hva(out, len);
             break;
         case VIRTIO_CUDA_REGISTERFATBINARY:
-            cuda_register_fatbinary(out, &len);
+            cuda_register_fatbinary(out, len);
             break;
         case VIRTIO_CUDA_UNREGISTERFATBINARY:
-            cuda_unregister_fatinary();
+            cuda_unregister_fatinary(out, len);
             break;
         case VIRTIO_CUDA_REGISTERFUNCTION:
-            cuda_register_function(out, &len);
+            cuda_register_function(out, len);
             break;
+
         case VIRTIO_CUDA_LAUNCH:
             cuda_launch(out, &len);
             break;
