@@ -31,10 +31,18 @@
 #include <openssl/buffer.h>
 #include <stdint.h>
 
-#define func() printf("[FUNC]%s\n",__FUNCTION__)
+// #define VIRTIO_CUDA_DEBUG
+#ifdef VIRTIO_CUDA_DEBUG
+    #define func() printf("[FUNC]%s\n",__FUNCTION__)
+    #define debug(fmt, arg...) printf("[DEBUG] "fmt, ##arg)
+#else
+    #define func()   
+    #define debug(fmt, arg...)   
+#endif
+
 #define error(fmt, arg...) printf("[ERROR]In file %s, line %d, "fmt, \
             __FILE__, __LINE__, ##arg)
-#define debug(fmt, arg...) printf("[DEBUG] "fmt, ##arg)
+
 #define cudaError(err) __cudaErrorCheck(err, __LINE__)
 
 #define TYPE_VIRTIO_CONSOLE_SERIAL_PORT "virtcudaport"
@@ -821,10 +829,9 @@ static void cuda_get_last_error(void *buf, ssize_t len)
 {
     cudaError_t err = 0;
     func();
-    VirtIOArg *header = (VirtIOArg*)buf;
-    // unsigned int id = get_current_id( (unsigned int)header->tid );
+    VirtIOArg *arg = (VirtIOArg*)buf;
     cudaError( (err=cudaGetLastError()) );
-    header->cmd = err;
+    arg->cmd = err;
 }
 /*
 static inline void cpu_physical_memory_read(hwaddr addr,
