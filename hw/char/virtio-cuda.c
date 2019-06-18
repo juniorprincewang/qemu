@@ -335,6 +335,7 @@ static void cuda_register_fatbinary(void *buf, ssize_t len)
     void *fat_bin;
     hwaddr gpa;
     VirtIOArg *arg = (VirtIOArg*)buf;
+    unsigned int id ;
     uint32_t src_size = arg->srcSize;
     // check out hmac
     gpa = (hwaddr)(arg->src);
@@ -342,7 +343,7 @@ static void cuda_register_fatbinary(void *buf, ssize_t len)
     // fat_bin = malloc(arg->srcSize);
     // cpu_physical_memory_read(gpa, fat_bin, arg->srcSize);
     hwaddr src_len = (hwaddr)src_size;
-    fat_bin = cpu_physical_memory_map(gpa, &src_len, 1);
+    fat_bin = cpu_physical_memory_map(gpa, &src_len, 0);
     if (!fat_bin || src_len != src_size) {
         error("Failed to map MMIO memory for"
                           " gpa 0x%lx element size %u\n",
@@ -363,7 +364,7 @@ static void cuda_register_fatbinary(void *buf, ssize_t len)
     */
     for(i =0; i<CudaEventMaxNum; i++)
         memset(&cudaEvent[i], 0, sizeof(cudaEvent_t));
-    cuError(cuInit(0));
+    cuError( cuInit(0));
     cuError( cuDeviceGetCount(&totalDevice) );
     cudaDevices = (CudaDev *)malloc(totalDevice * sizeof(CudaDev));
     memset(&zeroedDevice, 0, sizeof(CudaDev));
@@ -378,7 +379,9 @@ static void cuda_register_fatbinary(void *buf, ssize_t len)
     }
 
     cudaFunctionNum = 0;
-    cudaDeviceCurrent[0] = cudaDevices[0].device;
+    // cudaDeviceCurrent[0] = cudaDevices[0].device;
+    id = get_current_id( (unsigned int)arg->tid );
+    cudaDeviceCurrent[id] = cudaDevices[0].device;
     cudaEventNum = 0;
     cudaStreamNum = 0;
     arg->cmd = cudaSuccess;
@@ -406,8 +409,8 @@ static void cuda_register_function(uint8_t *buf, ssize_t len)
     uint32_t func_id;
     uint32_t fat_size, name_size;
     VirtIOArg *arg = (VirtIOArg*)buf;
+    unsigned int id = get_current_id( (unsigned int)arg->tid );
     func();
-
     fat_bin_gpa = (hwaddr)(arg->src);
     func_name_gpa = (hwaddr)(arg->dst);
     func_id = arg->flag;
@@ -428,7 +431,7 @@ static void cuda_register_function(uint8_t *buf, ssize_t len)
         devicesKernels[cudaFunctionNum].fatBin, \
         (char*)devicesKernels[cudaFunctionNum].functionName, \
         cudaFunctionNum);
-    load_module_kernel(cudaFunctionNum, \
+    load_module_kernel(cudaDeviceCurrent[id], \
         devicesKernels[cudaFunctionNum].fatBin, \
         (char*)devicesKernels[cudaFunctionNum].functionName, \
         func_id, cudaFunctionNum);
@@ -436,7 +439,7 @@ static void cuda_register_function(uint8_t *buf, ssize_t len)
     arg->cmd = cudaSuccess;
 }
 
-static void cuda_configure_call(uint8_t *buf, ssize_t *len)
+static void cuda_configure_call(uint8_t *buf, ssize_t len)
 {
     func();
     cudaError_t err;
@@ -453,7 +456,6 @@ static void cuda_configure_call(uint8_t *buf, ssize_t *len)
         kernelConf->blockDim, kernelConf->sharedMem, kernelConf->stream)));
     debug(" return value=%d\n", err);
     header->cmd = err;
-    *len = sizeof(VirtIOArg);
 }
 
 static void cuda_setup_argument(void *buf, ssize_t len)
@@ -461,53 +463,95 @@ static void cuda_setup_argument(void *buf, ssize_t len)
     func();
 }
 
-static void cuda_launch(uint8_t *buf, ssize_t *len)
+static void cuda_launch(uint8_t *buf, ssize_t len)
 {
-    func();
     cudaError_t err;
     int i=0;
-    uint32_t funcID, paraNum, paraIdx, funcIdx;
-    void **paraBuf;
-    VirtIOArg *header = (VirtIOArg*)buf;
-    unsigned int id = get_current_id( (unsigned int)header->tid );
-    KernelConf_t *para = (KernelConf_t*)(buf+sizeof(VirtIOArg));
-    KernelConf_t *kernelConf = (KernelConf_t*)(buf+sizeof(VirtIOArg)+header->srcSize);
-    funcID = header->flag;
-    paraNum = *((uint32_t*)para);
-    debug(" paraNum = %d\n", paraNum);
+    uint32_t func_id, para_num, para_idx, func_idx;
+    void **para_buf;
+    VirtIOArg *arg = (VirtIOArg*)buf;
+    unsigned int id = get_current_id( (unsigned int)arg->tid );
+    uint32_t para_size, conf_size;
+    hwaddr hw_para_size, hw_conf_size;
+    // hwaddr gpa_para = (hwaddr)(arg->src);
+    // hwaddr gpa_conf = (hwaddr)(arg->dst);
+    func();
+    debug("id = %u\n", id);
+    para_size = arg->srcSize;
+    conf_size = arg->dstSize;
     
-    paraBuf = malloc(paraNum * sizeof(void*));
-    paraIdx = sizeof(uint32_t);
-    for(i=0; i<paraNum; i++) {
-        paraBuf[i] = &para[paraIdx + sizeof(uint32_t)];
-        debug("arg %d = 0x%llx size=%u byte\n", i, 
-            *(unsigned long long*)paraBuf[i], *(unsigned int*)&para[paraIdx]);
-        paraIdx += *((uint32_t*)&para[paraIdx]) + sizeof(uint32_t);
-    }
+    hw_para_size = (hwaddr)para_size;
+    hw_conf_size = (hwaddr)conf_size;
 
-    for(funcIdx=0; funcIdx < cudaFunctionNum; funcIdx++) {
-        if( cudaDevices[cudaDeviceCurrent[id]].cudaFunctionID[funcIdx] == funcID)
-            break;
+    char *para = (char *)cpu_physical_memory_map((hwaddr)(arg->src), &hw_para_size, 0);
+    if (!para || hw_para_size != para_size) {
+        error("Failed to map MMIO memory for"
+                          " gpa 0x%lx element size %u\n",
+                            arg->src, para_size);
+        return ;
     }
-
-    debug("gridDim=%u %u %u\n", kernelConf->gridDim.x, 
-        kernelConf->gridDim.y, kernelConf->gridDim.z);
-    debug("blockDim=%u %u %u\n", kernelConf->blockDim.x, 
-        kernelConf->blockDim.y, kernelConf->blockDim.z);
-    debug("sharedMem=%ld\n", kernelConf->sharedMem);
+    KernelConf_t *conf = (KernelConf_t*)cpu_physical_memory_map(\
+        (hwaddr)(arg->dst), &hw_conf_size, 0);
+    if (!conf || hw_conf_size != conf_size) {
+        error("Failed to map MMIO memory for"
+                          " gpa 0x%lx element size %u\n",
+                            arg->dst, conf_size);
+        return ;
+    }
+    
     /*
-    cudaError( (err= cudaConfigureCall(kernelConf->gridDim, 
-        kernelConf->blockDim, kernelConf->sharedMem, kernelConf->stream)));
+    char *para = (char *)malloc(para_size);
+    cpu_physical_memory_read(gpa_para, para, para_size);
+    KernelConf_t *conf = (KernelConf_t *)malloc(conf_size);
+    cpu_physical_memory_read(gpa_conf, (void *)conf, conf_size);
+*/
+    func_id = (uint32_t)(arg->flag);
+    debug(" func_id = %u\n", func_id);
+    para_num = *((uint32_t*)para);
+    debug(" para_num = %u\n", para_num);
+    
+    para_buf = malloc(para_num * sizeof(void*));
+    para_idx = sizeof(uint32_t);
+    for(i=0; i<para_num; i++) {
+        para_buf[i] = &para[para_idx + sizeof(uint32_t)];
+        debug("arg %d = 0x%llx , size=%u byte\n", i, 
+            *(unsigned long long*)para_buf[i], *(unsigned int*)(&para[para_idx]));
+        para_idx += *(uint32_t*)(&para[para_idx]) + sizeof(uint32_t);
+    }
+    int found = 0;
+    for(func_idx=0; func_idx < cudaFunctionNum; func_idx++) {
+        if( cudaDevices[cudaDeviceCurrent[id]].cudaFunctionID[func_idx] == func_id){
+            found = 1;
+            break;
+        }
+    }
+    if(!found){
+        error("Failed to find func id.\n");
+        free(para_buf);
+        return;
+    } else {
+        debug("Found func_idx = %d.\n", func_idx);
+        debug("Found function  = %lu.\n", (uint64_t)(cudaDevices[cudaDeviceCurrent[id]].cudaFunction[func_idx]));
+    }
+
+    debug("gridDim=%u %u %u\n", conf->gridDim.x, 
+        conf->gridDim.y, conf->gridDim.z);
+    debug("blockDim=%u %u %u\n", conf->blockDim.x, 
+        conf->blockDim.y, conf->blockDim.z);
+    debug("sharedMem=%ld\n", conf->sharedMem);
+    debug("stream=%lu\n", (uint64_t)(conf->stream));
+    /*
+    cudaError( (err= cudaConfigureCall(conf->gridDim, 
+        conf->blockDim, conf->sharedMem, conf->stream)));
     */
     cuError( (err = cuLaunchKernel(
-        cudaDevices[cudaDeviceCurrent[id]].cudaFunction[funcIdx], \
-        kernelConf->gridDim.x, kernelConf->gridDim.y, kernelConf->gridDim.z,\
-        kernelConf->blockDim.x, kernelConf->blockDim.y, kernelConf->blockDim.z,\
-        kernelConf->sharedMem, kernelConf->stream, paraBuf, NULL) ) );
-    header->cmd = err;
-    *len = sizeof(VirtIOArg);
-    free(paraBuf);
-    paraBuf = NULL;
+        cudaDevices[cudaDeviceCurrent[id]].cudaFunction[func_idx], \
+        conf->gridDim.x, conf->gridDim.y, conf->gridDim.z,\
+        conf->blockDim.x, conf->blockDim.y, conf->blockDim.z,\
+        conf->sharedMem, conf->stream, para_buf, NULL) ) );
+    arg->cmd = err;
+    free(para_buf);
+    para_buf = NULL;
 }
 
 static void cuda_memcpy(uint8_t *buf, ssize_t len)
@@ -525,7 +569,7 @@ static void cuda_memcpy(uint8_t *buf, ssize_t len)
     size = arg->srcSize;
     if (arg->flag == cudaMemcpyHostToDevice) {
         hwaddr src_len = (hwaddr)size;
-        src = cpu_physical_memory_map(arg->src, &src_len, 1);
+        src = cpu_physical_memory_map(arg->src, &src_len, 0);
         if (!src || src_len != size) {
             error("Failed to map MMIO memory for"
                               " gpa 0x%lx element size %u\n",
@@ -538,7 +582,7 @@ static void cuda_memcpy(uint8_t *buf, ssize_t len)
         src = (void *)(arg->src);
         hwaddr dst_len = (hwaddr)size;
         // gpa => hva
-        dst = cpu_physical_memory_map(arg->dst, &dst_len, 1);
+        dst = cpu_physical_memory_map(arg->dst, &dst_len, 0);
         if (!dst || dst_len != size) {
             error("Failed to map MMIO memory for"
                               " gpa 0x%lx element size %u\n",
@@ -797,9 +841,8 @@ static inline void cpu_physical_memory_write(hwaddr addr,
 static void cuda_gpa_to_hva(void *buf, ssize_t len)
 {
     int a;
-    hwaddr gpa;
     VirtIOArg *arg = (VirtIOArg*)buf;
-    gpa = (hwaddr)(arg->src);
+    hwaddr gpa = (hwaddr)(arg->src);
     //a = gpa_to_hva(arg->src);
 
     cpu_physical_memory_read(gpa, &a, sizeof(int));
@@ -840,9 +883,8 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
         case VIRTIO_CUDA_REGISTERFUNCTION:
             cuda_register_function(out, len);
             break;
-
         case VIRTIO_CUDA_LAUNCH:
-            cuda_launch(out, &len);
+            cuda_launch(out, len);
             break;
         case VIRTIO_CUDA_MALLOC:
             cuda_malloc(out, len);
@@ -860,7 +902,7 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
             cuda_get_device_properties(out, len);
             break;
         case VIRTIO_CUDA_CONFIGURECALL:
-            cuda_configure_call(out, &len);
+            cuda_configure_call(out, len);
             break;
         case VIRTIO_CUDA_SETUPARGUMENT:
             cuda_setup_argument(out, len);
@@ -940,6 +982,7 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
         
         virtio_serial_throttle_port(port, true);
     }
+    free(out);
     out=NULL;
     debug("[+] WRITE BACK\n");
     return ret;
