@@ -450,20 +450,6 @@ static void cuda_register_function(uint8_t *buf, ssize_t len)
 static void cuda_configure_call(uint8_t *buf, ssize_t len)
 {
     func();
-    cudaError_t err;
-    VirtIOArg *header = (VirtIOArg*)buf;
-    // unsigned int id = get_current_id( (unsigned int)header->tid );
-    KernelConf_t *kernelConf = (KernelConf_t*)(buf+sizeof(VirtIOArg));
-
-    debug("gridDim=%u %u %u\n", kernelConf->gridDim.x, 
-        kernelConf->gridDim.y, kernelConf->gridDim.z);
-    debug("blockDim=%u %u %u\n", kernelConf->blockDim.x, 
-        kernelConf->blockDim.y, kernelConf->blockDim.z);
-    debug("sharedMem=%ld\n", kernelConf->sharedMem);
-    cudaError( (err= cudaConfigureCall(kernelConf->gridDim, 
-        kernelConf->blockDim, kernelConf->sharedMem, kernelConf->stream)));
-    debug(" return value=%d\n", err);
-    header->cmd = err;
 }
 
 static void cuda_setup_argument(void *buf, ssize_t len)
@@ -868,9 +854,9 @@ static void cuda_thread_synchronize(void *buf, ssize_t len)
 {
     cudaError_t err = 0;
     func();
-    VirtIOArg *header = (VirtIOArg*)buf;
+    VirtIOArg *arg = (VirtIOArg*)buf;
     cudaError( (err=cudaThreadSynchronize()) );
-    header->cmd = err;
+    arg->cmd = err;
 }
 
 static void cuda_get_last_error(void *buf, ssize_t len)
