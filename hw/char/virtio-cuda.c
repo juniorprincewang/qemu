@@ -370,7 +370,7 @@ static void cuda_register_fatbinary(void *buf, ssize_t len)
     */
     for(i =0; i<CudaEventMaxNum; i++)
         memset(&cudaEvent[i], 0, sizeof(cudaEvent_t));
-    memset(cudaStream, 0, CudaStreamMaxNum);
+    memset(cudaStream, 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
     /*for(i =0; i<CudaStreamMaxNum; i++)
         memset(&cudaStream[i], 0, sizeof(cudaStream_t));*/
     cuError( cuInit(0));
