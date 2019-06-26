@@ -400,11 +400,13 @@ static void cuda_unregister_fatinary(void *buf, ssize_t len)
     int i;
     VirtIOArg *arg = (VirtIOArg*)buf;
     func();
+    for(i=0; i<cudaFunctionNum; i++) {
+        free(devicesKernels[i].fatBin);
+        memset(devicesKernels[i].functionName, 0, sizeof(devicesKernels[i].functionName));
+    }
     for(i=0; i<totalDevice; i++) {
         if ( memcmp(&zeroedDevice, &cudaDevices[i], sizeof(CudaDev)) != 0 )
             cuError( cuCtxDestroy(cudaDevices[i].context) );
-        free(devicesKernels[i].fatBin);
-        memset(devicesKernels[i].functionName, 0, sizeof(devicesKernels[i].functionName));
     }
     free(cudaDevices);
     arg->cmd = cudaSuccess;
@@ -558,7 +560,7 @@ static void cuda_memcpy(uint8_t *buf, ssize_t len)
     func();
     // in case cudaReset was the previous call
     initialize_device(id);
-    debug("src=0x%lx, srcSize=%d, dst=9x%lx, dstSize=%d, kind=%lu\n", \
+    debug("src=0x%lx, srcSize=%d, dst=0x%lx, dstSize=%d, kind=%lu\n", \
         arg->src, arg->srcSize, arg->dst, arg->dstSize, arg->flag);
     size = arg->srcSize;
     if (arg->flag == cudaMemcpyHostToDevice) {
@@ -742,6 +744,11 @@ static void cuda_set_device(void *buf, ssize_t len)
     debug("set devices=%d\n", (int)(arg->flag));
 }
 
+static void cuda_set_device_flags(void *buf, ssize_t len)
+{
+
+}
+
 static void cuda_get_device_count(void *buf, ssize_t len)
 {
     VirtIOArg *arg = (VirtIOArg*)buf;
@@ -893,7 +900,8 @@ static void cuda_thread_synchronize(void *buf, ssize_t len)
     cudaError_t err = 0;
     func();
     VirtIOArg *arg = (VirtIOArg*)buf;
-    cudaError( (err=cudaThreadSynchronize()) );
+    // cudaError( (err=cudaThreadSynchronize()) );
+    cudaError( (err=cudaDeviceSynchronize()) );
     arg->cmd = err;
 }
 
@@ -914,6 +922,20 @@ static void cuda_get_last_error(void *buf, ssize_t len)
     cudaError( (err=cudaGetLastError()) );
     arg->cmd = err;
 }
+
+static void cuda_mem_get_info(void *buf, ssize_t len)
+{
+    cudaError_t err = 0;
+    size_t freeMem, totalMem;
+    func();
+    VirtIOArg *arg = (VirtIOArg*)buf;
+    cudaError( (err=cudaMemGetInfo(&freeMem, &totalMem)) );
+    arg->cmd = err;
+    arg->srcSize = freeMem;
+    arg->dstSize = totalMem;
+    debug("free memory = %lu, total memory = %lu.\n", freeMem, totalMem);
+}
+
 /*
 static inline void cpu_physical_memory_read(hwaddr addr,
                                             void *buf, int len)
@@ -1001,6 +1023,9 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
         case VIRTIO_CUDA_SETDEVICE:
             cuda_set_device(out, len);
             break;
+        case VIRTIO_CUDA_SETDEVICEFLAGS:
+            cuda_set_device_flags(out, len);
+            break;
         case VIRTIO_CUDA_DEVICERESET:
             cuda_device_reset(out, len);
             break;
@@ -1042,6 +1067,9 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
             break;
         case VIRTIO_CUDA_DEVICESYNCHRONIZE:
             cuda_device_synchronize(out, len);
+            break;
+        case VIRTIO_CUDA_MEMGETINFO:
+            cuda_mem_get_info(out, len);
             break;
         default:
             error("[+] header.cmd=%u, nr= %u \n", \
