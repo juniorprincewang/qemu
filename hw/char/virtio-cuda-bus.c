@@ -714,6 +714,7 @@ static void mark_port_added(VirtIOSerial *vser, uint32_t port_id)
 
 static void add_port(VirtIOSerial *vser, uint32_t port_id)
 {
+    func();
     mark_port_added(vser, port_id);
     send_control_event(vser, port_id, VIRTIO_CONSOLE_PORT_ADD, 1);
 }
@@ -723,7 +724,7 @@ static void virtser_port_device_plug(HotplugHandler *hotplug_dev,
                                      DeviceState *dev, Error **errp)
 {
     VirtIOSerialPort *port = VIRTIO_SERIAL_PORT(dev);
-
+    func();
     QTAILQ_INSERT_TAIL(&port->vser->ports, port, next);
     port->ivq = port->vser->ivqs[port->id];
     port->ovq = port->vser->ovqs[port->id];

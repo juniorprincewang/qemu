@@ -91,7 +91,6 @@ CUdevice cudaDeviceCurrent[16];
 KernelInfo devicesKernels[CudaFunctionMaxNum];
 cudaEvent_t cudaEvent[CudaEventMaxNum];
 uint32_t cudaEventNum;
-
 cudaStream_t cudaStream[CudaStreamMaxNum];
 uint32_t cudaStreamNum;
 // cudaError_t global_err; //
@@ -324,6 +323,7 @@ static unsigned int get_current_id(unsigned int tid)
 {
     return tid%totalDevice;
 }
+
 /*
 static void *memdup(const void *src, size_t n)
 {
@@ -334,10 +334,41 @@ static void *memdup(const void *src, size_t n)
     return memcpy(dst, src, n);
 }
 */
+static int initialized = 0;
+
+static void init_device(void)
+{
+    unsigned int i;
+    if (initialized) {
+        debug("initialized already!\n");
+        return;
+    }
+    initialized = 1;
+    cuError( cuInit(0));
+    cuError( cuDeviceGetCount(&totalDevice) );
+    cudaDevices = (CudaDev *)malloc(totalDevice * sizeof(CudaDev));
+    memset(&zeroedDevice, 0, sizeof(CudaDev));
+    i = totalDevice;
+    while(i-- != 0) {
+        debug("[+] Create context for device %d\n", i);
+        memset(&cudaDevices[i], 0, sizeof(CudaDev));
+        cuError( cuDeviceGet(&cudaDevices[i].device, i) );
+        cuError( cuCtxCreate(&cudaDevices[i].context, 0, cudaDevices[i].device) );
+        memset(&cudaDevices[i].cudaFunction, 0, sizeof(CUfunction) * CudaFunctionMaxNum);
+        cudaDevices[i].kernelsLoaded = 0;
+    }
+    cudaFunctionNum = 0;
+    cudaEventNum = 0;
+    cudaStreamNum = 0;
+    for(i =0; i<CudaEventMaxNum; i++)
+        memset(&cudaEvent[i], 0, sizeof(cudaEvent_t));
+    memset(cudaStream, 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
+}
+
 static void cuda_register_fatbinary(void *buf, ssize_t len)
 {
     func();
-    unsigned int i;
+    // unsigned int i;
     void *fat_bin;
     hwaddr gpa;
     VirtIOArg *arg = (VirtIOArg*)buf;
@@ -368,30 +399,13 @@ static void cuda_register_fatbinary(void *buf, ssize_t len)
         return ;
     }
     */
-    for(i =0; i<CudaEventMaxNum; i++)
-        memset(&cudaEvent[i], 0, sizeof(cudaEvent_t));
-    memset(cudaStream, 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
+
     /*for(i =0; i<CudaStreamMaxNum; i++)
         memset(&cudaStream[i], 0, sizeof(cudaStream_t));*/
-    cuError( cuInit(0));
-    cuError( cuDeviceGetCount(&totalDevice) );
-    cudaDevices = (CudaDev *)malloc(totalDevice * sizeof(CudaDev));
-    memset(&zeroedDevice, 0, sizeof(CudaDev));
-    i = totalDevice;
-    while(i-- != 0) {
-        debug("[+] Create context for device %d\n", i);
-        memset(&cudaDevices[i], 0, sizeof(CudaDev));
-        cuError( cuDeviceGet(&cudaDevices[i].device, i) );
-        cuError( cuCtxCreate(&cudaDevices[i].context, 0, cudaDevices[i].device) );
-        memset(&cudaDevices[i].cudaFunction, 0, sizeof(CUfunction) * CudaFunctionMaxNum);
-        cudaDevices[i].kernelsLoaded = 0;
-    }
-
-    cudaFunctionNum = 0;
+    
     id = get_current_id( (unsigned int)arg->tid );
     cudaDeviceCurrent[id] = cudaDevices[0].device;
-    cudaEventNum = 0;
-    cudaStreamNum = 0;
+    
     arg->cmd = cudaSuccess;
 }
 
@@ -1141,7 +1155,7 @@ static void virtconsole_realize(DeviceState *dev, Error **errp)
     func();
     VirtIOSerialPort *port = VIRTIO_SERIAL_PORT(dev);
     VirtIOSerialPortClass *k = VIRTIO_SERIAL_PORT_GET_CLASS(dev);
-    debug("port->id == %d\n", port->id == 0);
+    debug("port->id = %d\n", port->id );
     if (port->id == 0 && !k->is_console) {
         error_setg(errp, "Port number 0 on virtio-serial devices reserved "
                    "for virtconsole devices for backward compatibility.");
@@ -1149,6 +1163,10 @@ static void virtconsole_realize(DeviceState *dev, Error **errp)
     }
 
     virtio_serial_open(port);
+
+    /* init GPU device
+    */
+    init_device();
 }
 
 static void virtconsole_unrealize(DeviceState *dev, Error **errp)

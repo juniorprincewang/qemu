@@ -980,6 +980,7 @@ static void virtser_port_device_realize(DeviceState *dev, Error **errp)
     }
 
     max_nr_ports = port->vser->serial.max_virtserial_ports;
+    printf("port->name=%s, id=%d\n", port->name, port->id);
     if (port->id >= max_nr_ports) {
         error_setg(errp, "virtio-serial-bus: Out-of-range port id specified, "
                          "max. allowed: %u", max_nr_ports - 1);
@@ -999,13 +1000,13 @@ static void virtser_port_device_plug(HotplugHandler *hotplug_dev,
                                      DeviceState *dev, Error **errp)
 {
     VirtIOSerialPort *port = VIRTIO_SERIAL_PORT(dev);
-
+    func();
     QTAILQ_INSERT_TAIL(&port->vser->ports, port, next);
     port->ivq = port->vser->ivqs[port->id];
     port->ovq = port->vser->ovqs[port->id];
 
     add_port(port->vser, port->id);
-
+    printf("add port id=%d\n", port->id);
     /* Send an update to the guest about this new port added */
     virtio_notify_config(VIRTIO_DEVICE(hotplug_dev));
 }
