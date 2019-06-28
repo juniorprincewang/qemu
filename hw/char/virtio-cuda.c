@@ -14,7 +14,6 @@
 #include "chardev/char-fe.h"
 #include "qemu/error-report.h"
 #include "trace.h"
-#include "virtio-ioc.h"
 #include "hw/virtio/virtio-serial.h"
 #include "qapi/error.h"
 #include "qapi/qapi-events-char.h"
@@ -23,6 +22,10 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <builtin_types.h> //PATH: /usr/local/cuda/include/builtin_types.h
+// #include <driver_types.h>   // cudaDeviceProp
+
+#include "virtio-ioc.h"
+#include "message_queue.h"
 
 #include <openssl/hmac.h> // hmac EVP_MAX_MD_SIZE
 /*Encodes Base64 */
@@ -67,6 +70,7 @@ typedef struct CudaDev {
     unsigned int cudaFunctionID[CudaFunctionMaxNum];
     CUfunction cudaFunction[CudaFunctionMaxNum];
     CUmodule module;
+    struct cudaDeviceProp prop;
     int kernelsLoaded;
 }CudaDev;
 
@@ -93,6 +97,9 @@ cudaEvent_t cudaEvent[CudaEventMaxNum];
 uint32_t cudaEventNum;
 cudaStream_t cudaStream[CudaStreamMaxNum];
 uint32_t cudaStreamNum;
+int version;
+
+static int global_initialized = 0;
 // cudaError_t global_err; //
 static inline void __cudaErrorCheck(cudaError_t err, const int line)
 {
@@ -268,6 +275,45 @@ static void* gpa_to_hva(uint64_t pa)
 }
 */
 
+static int get_active_ports_nr(VirtIOSerial *vser)
+{
+    VirtIOSerialPort *port;
+    uint32_t nr_active_ports = 0;
+    QTAILQ_FOREACH(port, &vser->ports, next) {
+        nr_active_ports++;
+    }
+    return nr_active_ports;
+}
+
+typedef struct workload
+{
+    int id;
+    int device_id;
+    cudaStream_t stream;
+} workload;
+
+static workload *works;
+static struct message_queue worker_queue;
+static pthread_t worker_threads[WORKER_THREADS];
+
+
+static void spawn_threads(VirtIOSerial *vser)
+{
+    int nr_active_ports;
+    int i=0;
+    nr_active_ports = get_active_ports_nr(vser);
+    works = (workload)malloc(nr_active_ports*sizeof(workload));
+    debug("Starting %d heterogeneous computing workloads!\n", nr_active_ports);
+    message_queue_init(&worker_queue, sizeof(VirtIOArg), 512);
+    for(i=1; i<=nr_active_ports; i++) {
+        works[i].id = i;
+        works[i].device_id = i%totalDevice;
+        qemu_thread_create(&edu->thread, "edu", edu_fact_thread,
+                       edu, QEMU_THREAD_JOINABLE);
+    }
+    return;
+}
+
 static void load_module_kernel(int devID, void *fatBin, 
                 char *funcName, unsigned int funcID, int funcIndex)
 {
@@ -334,18 +380,18 @@ static void *memdup(const void *src, size_t n)
     return memcpy(dst, src, n);
 }
 */
-static int initialized = 0;
 
 static void init_device(void)
 {
     unsigned int i;
-    if (initialized) {
-        debug("initialized already!\n");
+    if (global_initialized) {
+        debug("global_initialized already!\n");
         return;
     }
-    initialized = 1;
+    global_initialized = 1;
     cuError( cuInit(0));
     cuError( cuDeviceGetCount(&totalDevice) );
+    cuError( cuDriverGetVersion(&version) );
     cudaDevices = (CudaDev *)malloc(totalDevice * sizeof(CudaDev));
     memset(&zeroedDevice, 0, sizeof(CudaDev));
     i = totalDevice;
@@ -355,6 +401,7 @@ static void init_device(void)
         cuError( cuDeviceGet(&cudaDevices[i].device, i) );
         cuError( cuCtxCreate(&cudaDevices[i].context, 0, cudaDevices[i].device) );
         memset(&cudaDevices[i].cudaFunction, 0, sizeof(CUfunction) * CudaFunctionMaxNum);
+        cudaError( cudaGetDeviceProperties(&cudaDevices[i].prop, i) );
         cudaDevices[i].kernelsLoaded = 0;
     }
     cudaFunctionNum = 0;
@@ -988,6 +1035,7 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
     func();
 
     debug("port->id=%d, buf=%6s, len=%ld\n", port->id, buf, len);
+    return 0;
     memcpy((void *)&header, (char *)buf, sizeof(VirtIOArg));
     out = (uint8_t *)malloc(len);
     memcpy((void *)out, (void *)buf, len);
@@ -1136,7 +1184,8 @@ static void set_guest_connected(VirtIOSerialPort *port, int guest_connected)
     func();
     // VirtConsole *vcon = VIRTIO_CONSOLE(port);
     DeviceState *dev = DEVICE(port);
-    //VirtIOSerialPortClass *k = VIRTIO_SERIAL_PORT_GET_CLASS(port);
+    VirtIOSerial *vser = VIRTIO_CUDA(dev);
+    
 
     if (dev->id) {
         qapi_event_send_vserport_change(dev->id, guest_connected,

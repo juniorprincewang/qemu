@@ -1636,7 +1636,7 @@ disabled with --disable-FEATURE, default is enabled if available:
   crypto-afalg    Linux AF_ALG crypto backend driver
   vhost-user      vhost-user support
   capstone        capstone disassembler support
-  cuda            cuda 8.0 support
+  cuda            cuda Runtime 10.0 support
 
 NOTE: The object files are built at the place where configure is launched
 EOF
@@ -4040,7 +4040,7 @@ fi
 ##########################################
 # enable cuda
 if test "$cuda" = "yes" ; then
-  LIBS="-lcrypto -lcuda -lcudart $LIBS"
+  LIBS="-lcrypto -lcuda -lcudart -lpthread $LIBS"
   LDFLAGS="-L/usr/local/cuda/lib64 $LDFLAGS"
   QEMU_CFLAGS="-I/usr/local/cuda/include $QEMU_CFLAGS"
 fi
@@ -5887,7 +5887,7 @@ echo "avx2 optimization $avx2_opt"
 echo "replication support $replication"
 echo "VxHS block device $vxhs"
 echo "capstone          $capstone"
-echo "CUDA 8.0 support      $cuda"
+echo "CUDA Runtime 10.0 support      $cuda"
 
 if test "$sdl_too_old" = "yes"; then
 echo "-> Your SDL version is too old - please upgrade to have SDL support"
