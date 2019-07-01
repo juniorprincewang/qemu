@@ -52,6 +52,10 @@
 #define VIRTIO_CONSOLE(obj) \
     OBJECT_CHECK(VirtConsole, (obj), TYPE_VIRTIO_CONSOLE_SERIAL_PORT)
 
+#ifndef WORKER_THREADS
+#define WORKER_THREADS 32
+#endif
+
 typedef struct VirtConsole {
     VirtIOSerialPort parent_obj;
     char *privatekeypath;    
@@ -92,7 +96,7 @@ int total_port;     // port number count
 int cudaFunctionNum;
 CudaDev *cudaDevices;
 CudaDev zeroedDevice;
-CUdevice cudaDeviceCurrent[16];
+CUdevice worker_cur_device[WORKER_THREADS];
 KernelInfo devicesKernels[CudaFunctionMaxNum];
 cudaEvent_t cudaEvent[CudaEventMaxNum];
 uint32_t cudaEventNum;
@@ -126,9 +130,6 @@ static inline void __cuErrorCheck(cudaError_t err, const int line)
 #define HMAC_SHA256_COUNT (1<<10)
 #define HMAC_SHA256_BASE64_SIZE 44 //HMAC_SHA256_SIZE*4/3
 
-#ifndef WORKER_THREADS
-#define WORKER_THREADS 32
-#endif
 /*
 static const char key[] = {
     0x30, 0x81, 0x9f, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 
@@ -267,7 +268,6 @@ static int get_active_ports_nr(VirtIOSerial *vser)
 
 typedef struct Workload
 {
-    int port_id;
     int device_id;
     VirtIOSerialPort *port;
     cudaStream_t stream;
@@ -306,28 +306,11 @@ static void load_module_kernel(int devID, void *fatBin,
     cudaDevices[devID].cudaFunctionID[funcIndex] = funcID;
     cudaDevices[devID].kernelsLoaded = 1;
 }
-/*
-static void reload_all_kernels(unsigned int id)
-{
-    func();
-    int i=0;
-    void *fatBin;
-    char *functionName;
-    unsigned int funcID;
-    for(i=0; i<cudaFunctionNum; i++) {
-        fatBin = devicesKernels[i].fatBin;
-        functionName = devicesKernels[i].functionName;
-        funcID = devicesKernels[i].funcID;
-        load_module_kernel( cudaDeviceCurrent[id], fatBin, 
-                functionName, funcID, i);
-    }
-}
-*/
 
 static cudaError_t initialize_device(unsigned int id)
 {
     func();
-    int dev = cudaDeviceCurrent[id];
+    int dev = worker_cur_device[id];
     if (dev >= total_device) {
         error("setting device = %d\n", dev);
         return cudaErrorInvalidDevice;
@@ -413,9 +396,6 @@ static void cuda_register_fatbinary(VirtIOArg *arg)
     uint32_t src_size = arg->srcSize;
     // check out hmac
     gpa = (hwaddr)(arg->src);
-    // try cpu_physical_memory_map next time
-    // fat_bin = malloc(arg->srcSize);
-    // cpu_physical_memory_read(gpa, fat_bin, arg->srcSize);
     hwaddr src_len = (hwaddr)src_size;
     fat_bin = cpu_physical_memory_map(gpa, &src_len, 0);
     if (!fat_bin || src_len != src_size) {
@@ -436,12 +416,6 @@ static void cuda_register_fatbinary(VirtIOArg *arg)
         return ;
     }
     */
-
-    /*for(i =0; i<CudaStreamMaxNum; i++)
-        memset(&cudaStream[i], 0, sizeof(cudaStream_t));*/
-    
-    id = get_current_id( (unsigned int)arg->tid );
-    cudaDeviceCurrent[id] = cudaDevices[0].device;
     
     arg->cmd = cudaSuccess;
 }
@@ -450,25 +424,24 @@ static void cuda_unregister_fatinary(VirtIOArg *arg)
 {
     int i;
     func();
-    for(i=0; i<cudaFunctionNum; i++) {
-        free(devicesKernels[i].fatBin);
-        memset(devicesKernels[i].functionName, 0, sizeof(devicesKernels[i].functionName));
-    }
-    for(i=0; i<total_device; i++) {
-        if ( memcmp(&zeroedDevice, &cudaDevices[i], sizeof(CudaDev)) != 0 )
-            cuError( cuCtxDestroy(cudaDevices[i].context) );
-    }
-    free(cudaDevices);
+    // for(i=0; i<cudaFunctionNum; i++) {
+    //     free(devicesKernels[i].fatBin);
+    //     memset(devicesKernels[i].functionName, 0, sizeof(devicesKernels[i].functionName));
+    // }
+    // for(i=0; i<total_device; i++) {
+    //     if ( memcmp(&zeroedDevice, &cudaDevices[i], sizeof(CudaDev)) != 0 )
+    //         cuError( cuCtxDestroy(cudaDevices[i].context) );
+    // }
+    // free(cudaDevices);
     arg->cmd = cudaSuccess;
 }
 
-static void cuda_register_function(VirtIOArg *arg)
+static void cuda_register_function(VirtIOArg *arg, int tid)
 {
     hwaddr fat_bin_gpa;
     hwaddr func_name_gpa;
     uint32_t func_id;
     uint32_t fat_size, name_size;
-    unsigned int id = get_current_id( (unsigned int)arg->tid );
     func();
     fat_bin_gpa = (hwaddr)(arg->src);
     func_name_gpa = (hwaddr)(arg->dst);
@@ -476,8 +449,6 @@ static void cuda_register_function(VirtIOArg *arg)
     fat_size = arg->srcSize;
     name_size = arg->dstSize;
     // initialize the KernelInfo
-    // fatSize = next_p2(header->srcSize);
-    // malloc 最大申请可达到4G内存，应该够用了
     devicesKernels[cudaFunctionNum].fatBin = malloc(fat_size);
 
     cpu_physical_memory_read(fat_bin_gpa, \
@@ -490,7 +461,7 @@ static void cuda_register_function(VirtIOArg *arg)
         devicesKernels[cudaFunctionNum].fatBin, \
         (char*)devicesKernels[cudaFunctionNum].functionName, \
         cudaFunctionNum);
-    load_module_kernel(cudaDeviceCurrent[id], \
+    load_module_kernel(worker_cur_device[tid], \
         devicesKernels[cudaFunctionNum].fatBin, \
         (char*)devicesKernels[cudaFunctionNum].functionName, \
         func_id, cudaFunctionNum);
@@ -564,7 +535,7 @@ static void cuda_launch(VirtIOArg *arg)
     }
     int found = 0;
     for(func_idx=0; func_idx < cudaFunctionNum; func_idx++) {
-        if( cudaDevices[cudaDeviceCurrent[id]].cudaFunctionID[func_idx] == func_id){
+        if( cudaDevices[worker_cur_device[id]].cudaFunctionID[func_idx] == func_id){
             found = 1;
             break;
         }
@@ -575,7 +546,8 @@ static void cuda_launch(VirtIOArg *arg)
         return;
     } else {
         debug("Found func_idx = %d.\n", func_idx);
-        debug("Found function  = %lu.\n", (uint64_t)(cudaDevices[cudaDeviceCurrent[id]].cudaFunction[func_idx]));
+        debug("Found function  = %lu.\n", 
+            (uint64_t)(cudaDevices[worker_cur_device[id]].cudaFunction[func_idx]));
     }
 
     debug("gridDim=%u %u %u\n", conf->gridDim.x, 
@@ -589,7 +561,7 @@ static void cuda_launch(VirtIOArg *arg)
         conf->blockDim, conf->sharedMem, conf->stream)));
     */
     cuError( (err = cuLaunchKernel(
-        cudaDevices[cudaDeviceCurrent[id]].cudaFunction[func_idx], \
+        cudaDevices[worker_cur_device[id]].cudaFunction[func_idx], \
         conf->gridDim.x, conf->gridDim.y, conf->gridDim.z,\
         conf->blockDim.x, conf->blockDim.y, conf->blockDim.z,\
         conf->sharedMem, conf->stream, para_buf, NULL) ) );
@@ -754,7 +726,7 @@ static void cuda_get_device(VirtIOArg *arg)
     unsigned int id = get_current_id( (unsigned int)arg->tid );
     initialize_device(id);
     arg->cmd = cudaSuccess;
-    dev = (int)(cudaDevices[cudaDeviceCurrent[id]].device);
+    dev = (int)(cudaDevices[worker_cur_device[id]].device);
     cpu_physical_memory_write(gpa, &dev, sizeof(int));
 }
 
@@ -778,7 +750,7 @@ static void cuda_set_device(VirtIOArg *arg)
     cudaError_t err = 0;
     unsigned int id = get_current_id( (unsigned int)arg->tid );
     func();
-    cudaDeviceCurrent[id] = (int)(arg->flag);
+    worker_cur_device[id] = (int)(arg->flag);
     cudaError( (err=initialize_device(id)) );
     arg->cmd = err;
     debug("set devices=%d\n", (int)(arg->flag));
@@ -805,8 +777,8 @@ static void cuda_device_reset(VirtIOArg *arg)
     cudaError_t err = 0;
     unsigned int id = get_current_id( (unsigned int)arg->tid );
     // should get rid of events for current devices
-    cuCtxDestroy(cudaDevices[cudaDeviceCurrent[id]].context ) ;
-    memset( &cudaDevices[cudaDeviceCurrent[id]], 0, sizeof(CudaDev) );
+    cuCtxDestroy(cudaDevices[worker_cur_device[id]].context ) ;
+    memset( &cudaDevices[worker_cur_device[id]], 0, sizeof(CudaDev) );
     cudaError( (err= cudaDeviceReset()) );
     arg->cmd = err;
     debug("reset devices\n");
@@ -981,6 +953,21 @@ static void cuda_gpa_to_hva(VirtIOArg *arg)
     cpu_physical_memory_write(gpa, &a, sizeof(int));
     arg->cmd = 1;//(int32_t)cudaSuccess;
 }
+
+static void init_worker_context(int port_id, int device_id)
+{
+    func();
+    int tid = port_id % total_port;
+    worker_cur_device[tid] = device_id;
+    cuError( cuCtxSetCurrent(cudaDevices[device_id].context) );
+    debug("thread %d => device %d\n", tid, device_id);
+}
+
+static void deinit_worker_context()
+{
+    func();
+}
+
 /*
 * worker process of thread
 */
@@ -990,9 +977,11 @@ static void *worker_threadproc(void *arg)
     int ret=0;
     Workload *work = (Workload*)arg;
     VirtIOSerialPort *port = work->port;
-    int port_id = work->port_id;
-    // int device_id = work->device_id;
+    int port_id = port->id;
+    int device_id = work->device_id;
     int tid = port_id%total_port;
+    debug("worker thread id=%d\n", tid);
+    init_worker_context(port_id, device_id);
     while(1) {
         msg = message_queue_read(&worker_queue[tid]);
         switch(msg->cmd) {
@@ -1006,7 +995,7 @@ static void *worker_threadproc(void *arg)
             cuda_unregister_fatinary(msg);
             break;
         case VIRTIO_CUDA_REGISTERFUNCTION:
-            cuda_register_function(msg);
+            cuda_register_function(msg, tid);
             break;
         case VIRTIO_CUDA_LAUNCH:
             cuda_launch(msg);
@@ -1028,6 +1017,7 @@ static void *worker_threadproc(void *arg)
             break;
         case VIRTIO_CUDA_CONFIGURECALL:
             message_queue_message_free(&worker_queue[tid], msg);
+            deinit_worker_context();
             return NULL;
         case VIRTIO_CUDA_SETUPARGUMENT:
             cuda_setup_argument(msg);
@@ -1111,160 +1101,19 @@ static void *worker_threadproc(void *arg)
 static ssize_t flush_buf(VirtIOSerialPort *port,
                          const uint8_t *buf, ssize_t len)
 {
-    ssize_t ret;
-    VirtIOArg header;
-    VirtIOArg *out;
     int tid;
+    int i;
     func();
 
     debug("port->id=%d, buf=%6s, len=%ld\n", port->id, buf, len);
     tid = port->id % total_port;
-    VirtIOArg *mq_block = message_queue_message_alloc_blocking(&worker_queue[tid]);
-    memcpy((void *)mq_block, buf, sizeof(VirtIOArg));
-    message_queue_write(&worker_queue[tid], mq_block);
+    for(i =0; i< len/sizeof(VirtIOArg); i++) {
+        VirtIOArg *mq_block = message_queue_message_alloc_blocking(&worker_queue[tid]);
+        memcpy((void *)mq_block, buf, sizeof(VirtIOArg));
+        message_queue_write(&worker_queue[tid], mq_block);
+    }
 
     return 0;
-
-    memcpy((void *)&header, (char *)buf, sizeof(VirtIOArg));
-    out = (VirtIOArg *)malloc(len);
-    memcpy((void *)out, (void *)buf, len);
-    debug("[+] header.cmd=%u, nr= %u \n", \
-        header.cmd, _IOC_NR(header.cmd));
-    debug("[+] header.tid = %d\n", header.tid);
-    switch(header.cmd) {
-        case VIRTIO_CUDA_HELLO:
-            cuda_gpa_to_hva(out);
-            break;
-        case VIRTIO_CUDA_REGISTERFATBINARY:
-            cuda_register_fatbinary(out);
-            break;
-        case VIRTIO_CUDA_UNREGISTERFATBINARY:
-            cuda_unregister_fatinary(out);
-            break;
-        case VIRTIO_CUDA_REGISTERFUNCTION:
-            cuda_register_function(out);
-            break;
-        case VIRTIO_CUDA_LAUNCH:
-            cuda_launch(out);
-            break;
-        case VIRTIO_CUDA_MALLOC:
-            cuda_malloc(out);
-            break;
-        case VIRTIO_CUDA_MEMCPY:
-            cuda_memcpy(out);
-            break;
-        case VIRTIO_CUDA_FREE:
-            cuda_free(out);
-            break;
-        case VIRTIO_CUDA_GETDEVICE:
-            cuda_get_device(out);
-            break;
-        case VIRTIO_CUDA_GETDEVICEPROPERTIES:
-            cuda_get_device_properties(out);
-            break;
-        case VIRTIO_CUDA_CONFIGURECALL:
-            cuda_configure_call(out);
-            break;
-        case VIRTIO_CUDA_SETUPARGUMENT:
-            cuda_setup_argument(out);
-            break;
-        case VIRTIO_CUDA_GETDEVICECOUNT:
-            cuda_get_device_count(out);
-            break;
-        case VIRTIO_CUDA_SETDEVICE:
-            cuda_set_device(out);
-            break;
-        case VIRTIO_CUDA_SETDEVICEFLAGS:
-            cuda_set_device_flags(out);
-            break;
-        case VIRTIO_CUDA_DEVICERESET:
-            cuda_device_reset(out);
-            break;
-        case VIRTIO_CUDA_STREAMCREATE:
-            cuda_stream_create(out);
-            break;
-        case VIRTIO_CUDA_STREAMDESTROY:
-            cuda_stream_destroy(out);
-            break;
-        case VIRTIO_CUDA_EVENTCREATE:
-            cuda_event_create(out);
-            break;
-        case VIRTIO_CUDA_EVENTCREATEWITHFLAGS:
-            cuda_event_create_with_flags(out);
-            break;
-        case VIRTIO_CUDA_EVENTDESTROY:
-            cuda_event_destroy(out);
-            break;
-        case VIRTIO_CUDA_EVENTRECORD:
-            cuda_event_record(out);
-            break;
-        case VIRTIO_CUDA_EVENTSYNCHRONIZE:
-            cuda_event_synchronize(out);
-            break;
-        case VIRTIO_CUDA_EVENTELAPSEDTIME:
-            cuda_event_elapsedtime(out);
-            break;
-        case VIRTIO_CUDA_THREADSYNCHRONIZE:
-            cuda_thread_synchronize(out);
-            break;
-        case VIRTIO_CUDA_GETLASTERROR:
-            cuda_get_last_error(out);
-            break;
-        case VIRTIO_CUDA_MEMCPY_ASYNC:
-            cuda_memcpy_async(out);
-            break;
-        case VIRTIO_CUDA_MEMSET:
-            cuda_memset(out);
-            break;
-        case VIRTIO_CUDA_DEVICESYNCHRONIZE:
-            cuda_device_synchronize(out);
-            break;
-        case VIRTIO_CUDA_MEMGETINFO:
-            cuda_mem_get_info(out);
-            break;
-        default:
-            error("[+] header.cmd=%u, nr= %u \n", \
-                header.cmd, _IOC_NR(header.cmd));
-            return -1;
-    }
-    ret = virtio_serial_write(port, (const uint8_t *)out, len);
-    if (ret < len) {
-        /*
-         * Ideally we'd get a better error code than just -1, but
-         * that's what the chardev interface gives us right now.  If
-         * we had a finer-grained message, like -EPIPE, we could close
-         * this connection.
-         */
-        if (ret < 0)
-            ret = 0;
-
-        /* XXX we should be queuing data to send later for the
-         * console devices too rather than silently dropping
-         * console data on EAGAIN. The Linux virtio-console
-         * hvc driver though does sends with spinlocks held,
-         * so if we enable throttling that'll stall the entire
-         * guest kernel, not merely the process writing to the
-         * console.
-         *
-         * While we could queue data for later write without
-         * enabling throttling, this would result in the guest
-         * being able to trigger arbitrary memory usage in QEMU
-         * buffering data for later writes.
-         *
-         * So fixing this problem likely requires fixing the
-         * Linux virtio-console hvc driver to not hold spinlocks
-         * while writing, and instead merely block the process
-         * that's writing. QEMU would then need some way to detect
-         * if the guest had the fixed driver too, before we can
-         * use throttling on host side.
-         */
-        
-        virtio_serial_throttle_port(port, true);
-    }
-    free(out);
-    out=NULL;
-    debug("[+] WRITE BACK\n");
-    return ret;
 }
 
 /* Callback function that's called when the guest opens/closes the port */
@@ -1311,8 +1160,7 @@ static void spawn_thread_by_port(VirtIOSerialPort *port)
     debug("Starting thread %d computing workloads!\n",thread_id);
     // qemu_thread_join(&worker_threads[thread_id]);
     message_queue_init(&worker_queue[thread_id], sizeof(VirtIOArg), 512);
-    works[thread_id].port_id = port_id;
-    works[thread_id].device_id = port_id%total_device;
+    works[thread_id].device_id = (port_id-1)%total_device;
     works[thread_id].port = port;
     sprintf(thread_name, "thread%d", thread_id);
     qemu_thread_create(&worker_threads[thread_id], thread_name, 
