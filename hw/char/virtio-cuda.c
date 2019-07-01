@@ -87,7 +87,8 @@ typedef struct KernelConf {
     cudaStream_t stream;
 } KernelConf_t ;
 
-int totalDevice;
+int total_device;   // total GPU device
+int total_port;     // port number count
 int cudaFunctionNum;
 CudaDev *cudaDevices;
 CudaDev zeroedDevice;
@@ -100,6 +101,8 @@ uint32_t cudaStreamNum;
 int version;
 
 static int global_initialized = 0;
+static int global_deinitialized = 0;
+
 // cudaError_t global_err; //
 static inline void __cudaErrorCheck(cudaError_t err, const int line)
 {
@@ -123,6 +126,9 @@ static inline void __cuErrorCheck(cudaError_t err, const int line)
 #define HMAC_SHA256_COUNT (1<<10)
 #define HMAC_SHA256_BASE64_SIZE 44 //HMAC_SHA256_SIZE*4/3
 
+#ifndef WORKER_THREADS
+#define WORKER_THREADS 32
+#endif
 /*
 static const char key[] = {
     0x30, 0x81, 0x9f, 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 
@@ -285,33 +291,77 @@ static int get_active_ports_nr(VirtIOSerial *vser)
     return nr_active_ports;
 }
 
-typedef struct workload
+typedef struct Workload
 {
-    int id;
+    int port_id;
     int device_id;
     cudaStream_t stream;
-} workload;
+} Workload;
 
-static workload *works;
+Workload works[WORKER_THREADS];
 static struct message_queue worker_queue;
-static pthread_t worker_threads[WORKER_THREADS];
+static QemuThread worker_threads[WORKER_THREADS];
 
-
-static void spawn_threads(VirtIOSerial *vser)
+static void *worker_threadproc(void *arg)
 {
-    int nr_active_ports;
-    int i=0;
-    nr_active_ports = get_active_ports_nr(vser);
-    works = (workload)malloc(nr_active_ports*sizeof(workload));
-    debug("Starting %d heterogeneous computing workloads!\n", nr_active_ports);
-    message_queue_init(&worker_queue, sizeof(VirtIOArg), 512);
-    for(i=1; i<=nr_active_ports; i++) {
-        works[i].id = i;
-        works[i].device_id = i%totalDevice;
-        qemu_thread_create(&edu->thread, "edu", edu_fact_thread,
-                       edu, QEMU_THREAD_JOINABLE);
+    VirtIOArg *message;
+    while(1) {
+        message = message_queue_read(&worker_queue);
+        switch(message->cmd) {
+            case 0:
+                break;
+            case 1:
+                message_queue_message_free(&worker_queue, message);
+                return NULL;
+        }
+        message_queue_message_free(&worker_queue, message);
     }
-    return;
+    return NULL;
+}
+
+
+// static void spawn_threads(VirtIOSerial *vser)
+// {
+//     int nr_active_ports;
+//     char thread_name[16];
+//     int i=0;
+//     nr_active_ports = get_active_ports_nr(vser);
+//     works = (workload)malloc(nr_active_ports*sizeof(workload));
+//     debug("Starting %d heterogeneous computing workloads!\n", nr_active_ports);
+//     message_queue_init(&worker_queue, sizeof(VirtIOArg), 512);
+//     for(i=1; i<=nr_active_ports; i++) {
+//         works[i].id = i;
+//         works[i].device_id = i%total_device;
+//         sprintf(thread_name, "thread%d", i);
+//         qemu_thread_create(&worker_threads[i], thread_name, 
+//             worker_threadproc, works, QEMU_THREAD_JOINABLE);
+//     }
+//     return;
+// }
+
+// static void end_threads(VirtIOSerial *vser)
+// {
+//     int nr_active_ports;
+//     int i=0;
+//     nr_active_ports = get_active_ports_nr(vser);
+//     debug("Ending %d heterogeneous computing workloads!\n", nr_active_ports);
+//     for(i=1; i<=nr_active_ports; i++) {
+//         qemu_thread_join(&worker_threads[i]);
+//     }
+//     return;
+// }
+
+static void threadpool_destroy(void) 
+{
+    int i =0;
+    for(i=0; i<total_port; ++i) {
+        VirtIOArg *poison = message_queue_message_alloc_blocking(&worker_queue);
+        message_queue_write(&worker_queue, poison);
+    }
+    for(i=0; i<total_port; ++i) {
+        qemu_thread_join(&worker_threads[i]);
+    }
+    message_queue_destroy(&worker_queue);
 }
 
 static void load_module_kernel(int devID, void *fatBin, 
@@ -348,7 +398,7 @@ static cudaError_t initialize_device(unsigned int id)
 {
     func();
     int dev = cudaDeviceCurrent[id];
-    if (dev >= totalDevice) {
+    if (dev >= total_device) {
         error("setting device = %d\n", dev);
         return cudaErrorInvalidDevice;
     } else {
@@ -367,7 +417,7 @@ static cudaError_t initialize_device(unsigned int id)
 
 static unsigned int get_current_id(unsigned int tid)
 {
-    return tid%totalDevice;
+    return tid%total_device;
 }
 
 /*
@@ -389,12 +439,14 @@ static void init_device(void)
         return;
     }
     global_initialized = 1;
+    global_deinitialized = 0;
+    total_port = 0;
     cuError( cuInit(0));
-    cuError( cuDeviceGetCount(&totalDevice) );
+    cuError( cuDeviceGetCount(&total_device) );
     cuError( cuDriverGetVersion(&version) );
-    cudaDevices = (CudaDev *)malloc(totalDevice * sizeof(CudaDev));
+    cudaDevices = (CudaDev *)malloc(total_device * sizeof(CudaDev));
     memset(&zeroedDevice, 0, sizeof(CudaDev));
-    i = totalDevice;
+    i = total_device;
     while(i-- != 0) {
         debug("[+] Create context for device %d\n", i);
         memset(&cudaDevices[i], 0, sizeof(CudaDev));
@@ -410,6 +462,16 @@ static void init_device(void)
     for(i =0; i<CudaEventMaxNum; i++)
         memset(&cudaEvent[i], 0, sizeof(cudaEvent_t));
     memset(cudaStream, 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
+    // initialize message queue for worker_threads
+    message_queue_init(&worker_queue, sizeof(VirtIOArg), 512);
+}
+
+static void deinit_device(void)
+{
+    if(global_deinitialized)
+        return;
+    func();
+    threadpool_destroy();
 }
 
 static void cuda_register_fatbinary(void *buf, ssize_t len)
@@ -465,7 +527,7 @@ static void cuda_unregister_fatinary(void *buf, ssize_t len)
         free(devicesKernels[i].fatBin);
         memset(devicesKernels[i].functionName, 0, sizeof(devicesKernels[i].functionName));
     }
-    for(i=0; i<totalDevice; i++) {
+    for(i=0; i<total_device; i++) {
         if ( memcmp(&zeroedDevice, &cudaDevices[i], sizeof(CudaDev)) != 0 )
             cuError( cuCtxDestroy(cudaDevices[i].context) );
     }
@@ -816,9 +878,9 @@ static void cuda_get_device_count(void *buf, ssize_t len)
     unsigned int id = get_current_id( (unsigned int)arg->tid );
     func();
     initialize_device(id);
-    debug("Device count=%d.\n", totalDevice);
+    debug("Device count=%d.\n", total_device);
     arg->cmd = (int32_t)cudaSuccess;
-    arg->flag = (uint64_t)totalDevice;
+    arg->flag = (uint64_t)total_device;
 }
 
 static void cuda_device_reset(void *buf, ssize_t len)
@@ -1024,8 +1086,11 @@ static void cuda_gpa_to_hva(void *buf, ssize_t len)
 }
 
 /* 
-*   Callback function that's called when the guest sends us data 
-*/
+*   Callback function that's called when the guest sends us data.  
+ * Guest wrote some data to the port. This data is handed over to
+ * the app via this callback.  The app can return a size less than
+ * 'len'.  In this case, throttling will be enabled for this port.
+ */
 static ssize_t flush_buf(VirtIOSerialPort *port,
                          const uint8_t *buf, ssize_t len)
 {
@@ -1184,21 +1249,67 @@ static void set_guest_connected(VirtIOSerialPort *port, int guest_connected)
     func();
     // VirtConsole *vcon = VIRTIO_CONSOLE(port);
     DeviceState *dev = DEVICE(port);
-    VirtIOSerial *vser = VIRTIO_CUDA(dev);
+    // VirtIOSerial *vser = VIRTIO_CUDA(dev);
     
-
     if (dev->id) {
         qapi_event_send_vserport_change(dev->id, guest_connected,
                                         &error_abort);
     }
 }
 
+/* Enable/disable backend for virtio serial port */
 static void virtconsole_enable_backend(VirtIOSerialPort *port, bool enable)
 {
     func();
+    debug("port id=%d, enable=%d\n", port->id, enable);
+
+    if(!enable && global_deinitialized) {
+        deinit_device();
+        return;
+    }
+    if(enable && !global_deinitialized)
+        global_deinitialized = 1;
+
     return ;
 }
 
+static void guest_writable(VirtIOSerialPort *port)
+{
+    func();
+    return;
+}
+
+static void spawn_thread_by_portid(int port_id)
+{
+    char thread_name[16];
+    int thread_id = port_id%total_port;
+    debug("Starting thread %d computing workloads!\n",thread_id);
+    // qemu_thread_join(&worker_threads[thread_id]);
+    works[thread_id].port_id = port_id;
+    works[thread_id].device_id = port_id%total_device;
+    sprintf(thread_name, "thread%d", thread_id);
+    qemu_thread_create(&worker_threads[thread_id], thread_name, 
+            worker_threadproc, &works[thread_id], QEMU_THREAD_JOINABLE);
+}
+
+/* Guest is now ready to accept data (virtqueues set up). 
+* when front driver init the driver.
+*/
+static void virtconsole_guest_ready(VirtIOSerialPort *port)
+{
+    VirtIOSerial *vser = port->vser;
+    total_port = get_active_ports_nr(vser);
+    debug("nr active ports =%d\n", total_port);
+    func();
+    debug("port %d is ready.\n", port->id);
+    spawn_thread_by_portid(port->id);
+    return;
+}
+
+/*
+ * The per-port (or per-app) realize function that's called when a
+ * new device is found on the bus.
+*/
 static void virtconsole_realize(DeviceState *dev, Error **errp)
 {
     func();
@@ -1218,6 +1329,10 @@ static void virtconsole_realize(DeviceState *dev, Error **errp)
     init_device();
 }
 
+/*
+* Per-port unrealize function that's called when a port gets
+* hot-unplugged or removed.
+*/
 static void virtconsole_unrealize(DeviceState *dev, Error **errp)
 {
     func();
@@ -1245,6 +1360,8 @@ static void virtserialport_class_init(ObjectClass *klass, void *data)
     k->have_data = flush_buf;
     k->set_guest_connected = set_guest_connected;
     k->enable_backend = virtconsole_enable_backend;
+    k->guest_ready = virtconsole_guest_ready;
+    k->guest_writable = guest_writable;
     dc->props = virtserialport_properties;
 }
 
