@@ -67,6 +67,7 @@ typedef struct VirtConsole {
 #define CudaFunctionMaxNum 1024
 #define CudaEventMaxNum 32
 #define CudaStreamMaxNum 32
+#define CudaFunctionName 128
 
 typedef struct CudaDev {
     CUdevice device;
@@ -80,7 +81,7 @@ typedef struct CudaDev {
 
 typedef struct KernelInfo {
     void *fatBin;
-    char functionName[512];
+    char functionName[CudaFunctionName];
     uint32_t funcID;
 } KernelInfo;
 
@@ -93,11 +94,12 @@ typedef struct KernelConf {
 
 int total_device;   // total GPU device
 int total_port;     // port number count
-int cudaFunctionNum;
 CudaDev *cudaDevices;
 CudaDev zeroedDevice;
+int cudaFunctionNum[WORKER_THREADS];
 CUdevice worker_cur_device[WORKER_THREADS];
-KernelInfo devicesKernels[CudaFunctionMaxNum];
+KernelInfo devicesKernels[WORKER_THREADS][CudaFunctionMaxNum];
+
 cudaEvent_t cudaEvent[CudaEventMaxNum];
 uint32_t cudaEventNum;
 cudaStream_t cudaStream[CudaStreamMaxNum];
@@ -369,7 +371,6 @@ static void init_device(void)
         cudaError( cudaGetDeviceProperties(&cudaDevices[i].prop, i) );
         cudaDevices[i].kernelsLoaded = 0;
     }
-    cudaFunctionNum = 0;
     cudaEventNum = 0;
     cudaStreamNum = 0;
     for(i =0; i<CudaEventMaxNum; i++)
@@ -392,7 +393,6 @@ static void cuda_register_fatbinary(VirtIOArg *arg)
     // unsigned int i;
     void *fat_bin;
     hwaddr gpa;
-    unsigned int id ;
     uint32_t src_size = arg->srcSize;
     // check out hmac
     gpa = (hwaddr)(arg->src);
@@ -420,19 +420,21 @@ static void cuda_register_fatbinary(VirtIOArg *arg)
     arg->cmd = cudaSuccess;
 }
 
-static void cuda_unregister_fatinary(VirtIOArg *arg)
+static void cuda_unregister_fatinary(VirtIOArg *arg, int tid)
 {
     int i;
     func();
-    // for(i=0; i<cudaFunctionNum; i++) {
-    //     free(devicesKernels[i].fatBin);
-    //     memset(devicesKernels[i].functionName, 0, sizeof(devicesKernels[i].functionName));
-    // }
-    // for(i=0; i<total_device; i++) {
-    //     if ( memcmp(&zeroedDevice, &cudaDevices[i], sizeof(CudaDev)) != 0 )
-    //         cuError( cuCtxDestroy(cudaDevices[i].context) );
-    // }
-    // free(cudaDevices);
+    for(i=0; i<cudaFunctionNum[tid]; i++) {
+        free(devicesKernels[tid][i].fatBin);
+        devicesKernels[tid][i].fatBin = NULL;
+        memset(devicesKernels[tid][i].functionName, 0, 
+            sizeof(devicesKernels[tid][i].functionName));
+    }
+    for(i=0; i<total_device; i++) {
+        if ( memcmp(&zeroedDevice, &cudaDevices[i], sizeof(CudaDev)) != 0 )
+            cuError( cuCtxDestroy(cudaDevices[i].context) );
+    }
+    free(cudaDevices);
     arg->cmd = cudaSuccess;
 }
 
@@ -442,6 +444,7 @@ static void cuda_register_function(VirtIOArg *arg, int tid)
     hwaddr func_name_gpa;
     uint32_t func_id;
     uint32_t fat_size, name_size;
+    int nr_func = cudaFunctionNum[tid];
     func();
     fat_bin_gpa = (hwaddr)(arg->src);
     func_name_gpa = (hwaddr)(arg->dst);
@@ -449,49 +452,45 @@ static void cuda_register_function(VirtIOArg *arg, int tid)
     fat_size = arg->srcSize;
     name_size = arg->dstSize;
     // initialize the KernelInfo
-    devicesKernels[cudaFunctionNum].fatBin = malloc(fat_size);
+    devicesKernels[tid][nr_func].fatBin = malloc(fat_size);
 
     cpu_physical_memory_read(fat_bin_gpa, \
-        devicesKernels[cudaFunctionNum].fatBin, fat_size);
+        devicesKernels[tid][nr_func].fatBin, fat_size);
     cpu_physical_memory_read(func_name_gpa, \
-        devicesKernels[cudaFunctionNum].functionName, name_size);
+        devicesKernels[tid][nr_func].functionName, name_size);
 
-    devicesKernels[cudaFunctionNum].funcID = func_id;
-    debug("fatBin = %16p, name='%s', cudaFunctionNum = %d\n", 
-        devicesKernels[cudaFunctionNum].fatBin, \
-        (char*)devicesKernels[cudaFunctionNum].functionName, \
-        cudaFunctionNum);
+    devicesKernels[tid][nr_func].funcID = func_id;
+    debug("fatBin = %16p, name='%s', nr_func = %d\n", 
+        devicesKernels[tid][nr_func].fatBin, \
+        (char*)devicesKernels[tid][nr_func].functionName, \
+        nr_func);
     load_module_kernel(worker_cur_device[tid], \
-        devicesKernels[cudaFunctionNum].fatBin, \
-        (char*)devicesKernels[cudaFunctionNum].functionName, \
-        func_id, cudaFunctionNum);
-    cudaFunctionNum++;
+        devicesKernels[tid][nr_func].fatBin, \
+        (char*)devicesKernels[tid][nr_func].functionName, \
+        func_id, nr_func);
+    cudaFunctionNum[tid]++;
     arg->cmd = cudaSuccess;
 }
 
-static void cuda_configure_call(VirtIOArg *arg)
-{
-    func();
-}
 
 static void cuda_setup_argument(VirtIOArg *arg)
 {
     func();
 }
 
-static void cuda_launch(VirtIOArg *arg)
+static void cuda_launch(VirtIOArg *arg, int tid)
 {
     cudaError_t err;
     int i=0;
     uint32_t func_id, para_num, para_idx, func_idx;
     void **para_buf;
-    unsigned int id = get_current_id( (unsigned int)arg->tid );
+    // unsigned int id = get_current_id( (unsigned int)arg->tid );
     uint32_t para_size, conf_size;
     hwaddr hw_para_size, hw_conf_size;
     // hwaddr gpa_para = (hwaddr)(arg->src);
     // hwaddr gpa_conf = (hwaddr)(arg->dst);
     func();
-    debug("id = %u\n", id);
+    debug("thread id = %u\n", tid);
     para_size = arg->srcSize;
     conf_size = arg->dstSize;
     
@@ -534,8 +533,8 @@ static void cuda_launch(VirtIOArg *arg)
         para_idx += *(uint32_t*)(&para[para_idx]) + sizeof(uint32_t);
     }
     int found = 0;
-    for(func_idx=0; func_idx < cudaFunctionNum; func_idx++) {
-        if( cudaDevices[worker_cur_device[id]].cudaFunctionID[func_idx] == func_id){
+    for(func_idx=0; func_idx < cudaFunctionNum[tid]; func_idx++) {
+        if( cudaDevices[worker_cur_device[tid]].cudaFunctionID[func_idx] == func_id){
             found = 1;
             break;
         }
@@ -547,7 +546,7 @@ static void cuda_launch(VirtIOArg *arg)
     } else {
         debug("Found func_idx = %d.\n", func_idx);
         debug("Found function  = %lu.\n", 
-            (uint64_t)(cudaDevices[worker_cur_device[id]].cudaFunction[func_idx]));
+            (uint64_t)(cudaDevices[worker_cur_device[tid]].cudaFunction[func_idx]));
     }
 
     debug("gridDim=%u %u %u\n", conf->gridDim.x, 
@@ -561,7 +560,7 @@ static void cuda_launch(VirtIOArg *arg)
         conf->blockDim, conf->sharedMem, conf->stream)));
     */
     cuError( (err = cuLaunchKernel(
-        cudaDevices[worker_cur_device[id]].cudaFunction[func_idx], \
+        cudaDevices[worker_cur_device[tid]].cudaFunction[func_idx], \
         conf->gridDim.x, conf->gridDim.y, conf->gridDim.z,\
         conf->blockDim.x, conf->blockDim.y, conf->blockDim.z,\
         conf->sharedMem, conf->stream, para_buf, NULL) ) );
@@ -718,15 +717,14 @@ static void cuda_free(VirtIOArg *arg)
     debug(" ptr = 0x%lx, return value=%d\n", arg->src, err);
 }
 
-static void cuda_get_device(VirtIOArg *arg)
+static void cuda_get_device(VirtIOArg *arg, int tid)
 {
     int dev = 0;
     hwaddr gpa = (hwaddr)(arg->dst);
     func();
-    unsigned int id = get_current_id( (unsigned int)arg->tid );
-    initialize_device(id);
+    initialize_device(tid);
     arg->cmd = cudaSuccess;
-    dev = (int)(cudaDevices[worker_cur_device[id]].device);
+    dev = (int)(cudaDevices[worker_cur_device[tid]].device);
     cpu_physical_memory_write(gpa, &dev, sizeof(int));
 }
 
@@ -745,13 +743,12 @@ static void cuda_get_device_properties(VirtIOArg *arg)
     cpu_physical_memory_write(gpa, &prop, arg->dstSize);
 }
 
-static void cuda_set_device(VirtIOArg *arg)
+static void cuda_set_device(VirtIOArg *arg, int tid)
 {
     cudaError_t err = 0;
-    unsigned int id = get_current_id( (unsigned int)arg->tid );
     func();
-    worker_cur_device[id] = (int)(arg->flag);
-    cudaError( (err=initialize_device(id)) );
+    worker_cur_device[tid] = (int)(arg->flag);
+    cudaError( (err=initialize_device(tid)) );
     arg->cmd = err;
     debug("set devices=%d\n", (int)(arg->flag));
 }
@@ -771,16 +768,15 @@ static void cuda_get_device_count(VirtIOArg *arg)
     arg->flag = (uint64_t)total_device;
 }
 
-static void cuda_device_reset(VirtIOArg *arg)
+static void cuda_device_reset(VirtIOArg *arg, int tid)
 {
     func();
-    cudaError_t err = 0;
-    unsigned int id = get_current_id( (unsigned int)arg->tid );
+    // cudaError_t err = 0;
     // should get rid of events for current devices
-    cuCtxDestroy(cudaDevices[worker_cur_device[id]].context ) ;
-    memset( &cudaDevices[worker_cur_device[id]], 0, sizeof(CudaDev) );
-    cudaError( (err= cudaDeviceReset()) );
-    arg->cmd = err;
+    cuCtxDestroy(cudaDevices[worker_cur_device[tid]].context ) ;
+    memset( &cudaDevices[worker_cur_device[tid]], 0, sizeof(CudaDev) );
+    // cudaError( (err= cudaDeviceReset()) );
+    arg->cmd = cudaSuccess;
     debug("reset devices\n");
 }
 
@@ -963,7 +959,7 @@ static void init_worker_context(int port_id, int device_id)
     debug("thread %d => device %d\n", tid, device_id);
 }
 
-static void deinit_worker_context()
+static void deinit_worker_context(void)
 {
     func();
 }
@@ -982,6 +978,7 @@ static void *worker_threadproc(void *arg)
     int tid = port_id%total_port;
     debug("worker thread id=%d\n", tid);
     init_worker_context(port_id, device_id);
+    return NULL;
     while(1) {
         msg = message_queue_read(&worker_queue[tid]);
         switch(msg->cmd) {
@@ -992,13 +989,13 @@ static void *worker_threadproc(void *arg)
             cuda_register_fatbinary(msg);
             break;
         case VIRTIO_CUDA_UNREGISTERFATBINARY:
-            cuda_unregister_fatinary(msg);
+            cuda_unregister_fatinary(msg, tid);
             break;
         case VIRTIO_CUDA_REGISTERFUNCTION:
             cuda_register_function(msg, tid);
             break;
         case VIRTIO_CUDA_LAUNCH:
-            cuda_launch(msg);
+            cuda_launch(msg, tid);
             break;
         case VIRTIO_CUDA_MALLOC:
             cuda_malloc(msg);
@@ -1010,7 +1007,7 @@ static void *worker_threadproc(void *arg)
             cuda_free(msg);
             break;
         case VIRTIO_CUDA_GETDEVICE:
-            cuda_get_device(msg);
+            cuda_get_device(msg, tid);
             break;
         case VIRTIO_CUDA_GETDEVICEPROPERTIES:
             cuda_get_device_properties(msg);
@@ -1026,13 +1023,13 @@ static void *worker_threadproc(void *arg)
             cuda_get_device_count(msg);
             break;
         case VIRTIO_CUDA_SETDEVICE:
-            cuda_set_device(msg);
+            cuda_set_device(msg, tid);
             break;
         case VIRTIO_CUDA_SETDEVICEFLAGS:
             cuda_set_device_flags(msg);
             break;
         case VIRTIO_CUDA_DEVICERESET:
-            cuda_device_reset(msg);
+            cuda_device_reset(msg, tid);
             break;
         case VIRTIO_CUDA_STREAMCREATE:
             cuda_stream_create(msg);
@@ -1158,14 +1155,14 @@ static void spawn_thread_by_port(VirtIOSerialPort *port)
     int port_id = port->id;
     int thread_id = port_id%total_port;
     debug("Starting thread %d computing workloads!\n",thread_id);
-    // qemu_thread_join(&worker_threads[thread_id]);
+    // initialize message queue for worker_threads[thread_id]
     message_queue_init(&worker_queue[thread_id], sizeof(VirtIOArg), 512);
     works[thread_id].device_id = (port_id-1)%total_device;
     works[thread_id].port = port;
     sprintf(thread_name, "thread%d", thread_id);
     qemu_thread_create(&worker_threads[thread_id], thread_name, 
             worker_threadproc, &works[thread_id], QEMU_THREAD_JOINABLE);
-    // initialize message queue for worker_threads[thread_id]
+    cudaFunctionNum[thread_id]=0;
 }
 
 /* Guest is now ready to accept data (virtqueues set up). 
@@ -1178,6 +1175,7 @@ static void virtconsole_guest_ready(VirtIOSerialPort *port)
     debug("nr active ports =%d\n", total_port);
     func();
     debug("port %d is ready.\n", port->id);
+
     spawn_thread_by_port(port);
     return;
 }

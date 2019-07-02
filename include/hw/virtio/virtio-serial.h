@@ -84,6 +84,9 @@ typedef struct VirtIOSerialPortClass {
                          ssize_t len);
 } VirtIOSerialPortClass;
 
+
+
+
 /*
  * This is the state that's shared between all the ports.  Some of the
  * state is configurable via command-line options. Some of it can be

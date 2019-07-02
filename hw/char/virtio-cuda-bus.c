@@ -215,7 +215,10 @@ static void handle_control_message(VirtIOSerial *vser, void *buf, size_t len)
     struct virtio_console_control cpkt, *gcpkt;
     uint8_t *buffer;
     size_t buffer_len;
+    int size;
+    const char *ctest="test";
 
+    func();
     gcpkt = buf;
 
     if (len < sizeof(cpkt)) {
@@ -228,6 +231,7 @@ static void handle_control_message(VirtIOSerial *vser, void *buf, size_t len)
 
     trace_virtio_serial_handle_control_message(cpkt.event, cpkt.value);
 
+    printf("event = %d\n", cpkt.event);
     if (cpkt.event == VIRTIO_CONSOLE_DEVICE_READY) {
         if (!cpkt.value) {
             error_report("virtio-serial-bus: Guest failure in adding device %s",
@@ -243,6 +247,24 @@ static void handle_control_message(VirtIOSerial *vser, void *buf, size_t len)
         }
         return;
     }
+    if (cpkt.event == VIRITO_CONSOLE_VGPU) {
+        printf("VIRITO_CONSOLE_VGPU\n");
+        virtio_stw_p(vdev, &cpkt.event, VIRITO_CONSOLE_VGPU);
+        virtio_stw_p(vdev, &cpkt.value, 1);
+
+        buffer_len = sizeof(cpkt) + sizeof(uint32_t) + 2*strlen(ctest);
+        buffer = g_malloc(buffer_len);
+        size = 2;
+        memcpy(buffer, &cpkt, sizeof(cpkt));
+        memcpy(buffer + sizeof(cpkt), &size, sizeof(size));
+        memcpy(buffer + sizeof(cpkt) + sizeof(uint32_t), ctest, strlen(ctest));
+        memcpy(buffer + sizeof(cpkt) + sizeof(uint32_t)+strlen(ctest), 
+            ctest, strlen(ctest));
+
+        send_control_msg(vser, buffer, buffer_len);
+        g_free(buffer);
+        return;
+    }
 
     port = find_port_by_id(vser, virtio_ldl_p(vdev, &gcpkt->id));
     if (!port) {
@@ -254,7 +276,6 @@ static void handle_control_message(VirtIOSerial *vser, void *buf, size_t len)
     trace_virtio_serial_handle_control_message_port(port->id);
 
     vsc = VIRTIO_SERIAL_PORT_GET_CLASS(port);
-
     switch(cpkt.event) {
     case VIRTIO_CONSOLE_PORT_READY:
         if (!cpkt.value) {
@@ -714,7 +735,6 @@ static void mark_port_added(VirtIOSerial *vser, uint32_t port_id)
 
 static void add_port(VirtIOSerial *vser, uint32_t port_id)
 {
-    func();
     mark_port_added(vser, port_id);
     send_control_event(vser, port_id, VIRTIO_CONSOLE_PORT_ADD, 1);
 }
@@ -724,7 +744,6 @@ static void virtser_port_device_plug(HotplugHandler *hotplug_dev,
                                      DeviceState *dev, Error **errp)
 {
     VirtIOSerialPort *port = VIRTIO_SERIAL_PORT(dev);
-    func();
     QTAILQ_INSERT_TAIL(&port->vser->ports, port, next);
     port->ivq = port->vser->ivqs[port->id];
     port->ovq = port->vser->ovqs[port->id];
