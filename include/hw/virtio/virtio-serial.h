@@ -171,10 +171,13 @@ typedef struct VirtIOSerialPostLoad {
     } *connected;
 } VirtIOSerialPostLoad;
 
+/*
+* Be careful of the memory alignment and padding, add __attribute__((packed)).
+*/
 struct GPUDevice {
-    int device_id;
+    uint32_t device_id;
     struct cudaDeviceProp prop;
-};
+} __attribute__((packed));
 
 struct VirtIOSerial {
     VirtIODevice parent_obj;

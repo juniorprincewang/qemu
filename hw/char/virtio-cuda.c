@@ -1127,10 +1127,10 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
 static void set_guest_connected(VirtIOSerialPort *port, int guest_connected)
 {
     func();
-    // VirtConsole *vcon = VIRTIO_CONSOLE(port);
     DeviceState *dev = DEVICE(port);
     // VirtIOSerial *vser = VIRTIO_CUDA(dev);
-    
+    debug("guest_connected=%d\n", guest_connected);
+
     if (dev->id) {
         qapi_event_send_vserport_change(dev->id, guest_connected,
                                         &error_abort);

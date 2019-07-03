@@ -862,6 +862,7 @@ static void virtio_cuda_device_realize(DeviceState *dev, Error **errp)
     vser->gpus = g_malloc(gcount*sizeof(struct GPUDevice *));
     for (i = 0; i < gcount; i++) {
         vser->gpus[i] = (struct GPUDevice *)g_malloc(sizeof(struct GPUDevice));
+        cudaSetDevice(i);
         vser->gpus[i]->device_id = i;
         err = cudaGetDeviceProperties(&vser->gpus[i]->prop, i);
         if (err != cudaSuccess) {
