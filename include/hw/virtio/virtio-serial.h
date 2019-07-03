@@ -20,6 +20,9 @@
 #include "hw/qdev.h"
 #include "hw/virtio/virtio.h"
 
+#include "cuda.h"
+#include "cuda_runtime.h"
+
 struct virtio_serial_conf {
     /* Max. number of ports we can have for a virtio-serial device */
     uint32_t max_virtserial_ports;
@@ -83,9 +86,6 @@ typedef struct VirtIOSerialPortClass {
     ssize_t (*have_data)(VirtIOSerialPort *port, const uint8_t *buf,
                          ssize_t len);
 } VirtIOSerialPortClass;
-
-
-
 
 /*
  * This is the state that's shared between all the ports.  Some of the
@@ -171,13 +171,23 @@ typedef struct VirtIOSerialPostLoad {
     } *connected;
 } VirtIOSerialPostLoad;
 
+struct GPUDevice {
+    int device_id;
+    struct cudaDeviceProp prop;
+};
+
 struct VirtIOSerial {
     VirtIODevice parent_obj;
 
     VirtQueue *c_ivq, *c_ovq;
     /* Arrays of ivqs and ovqs: one per port */
     VirtQueue **ivqs, **ovqs;
-
+    /* Arrays of GPUs */
+    struct GPUDevice **gpus;
+    /* gpu count on hosts*/
+    int gcount;
+    /*mutex protecting global init & deinit*/
+    QemuMutex init_mutex, deinit_mutex;
     VirtIOSerialBus bus;
 
     QTAILQ_HEAD(, VirtIOSerialPort) ports;

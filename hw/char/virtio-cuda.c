@@ -106,6 +106,7 @@ cudaStream_t cudaStream[CudaStreamMaxNum];
 uint32_t cudaStreamNum;
 int version;
 
+
 static int global_initialized = 0;
 static int global_deinitialized = 0;
 
@@ -286,6 +287,7 @@ static void threadpool_destroy(void)
     int i =0;
     for(i=0; i<total_port; ++i) {
         VirtIOArg *poison = message_queue_message_alloc_blocking(&worker_queue[i]);
+        poison->cmd = VIRTIO_CUDA_CONFIGURECALL;
         message_queue_write(&worker_queue[i], poison);
     }
     for(i=0; i<total_port; ++i) {
@@ -346,15 +348,20 @@ static void *memdup(const void *src, size_t n)
 }
 */
 
-static void init_device(void)
+static void init_device(VirtIOSerial *vser)
 {
     unsigned int i;
-    if (global_initialized) {
+    qemu_mutex_lock(&vser->init_mutex);
+    if (global_initialized==1) {
         debug("global_initialized already!\n");
+        qemu_mutex_unlock(&vser->init_mutex);
         return;
     }
     global_initialized = 1;
     global_deinitialized = 0;
+    qemu_mutex_unlock(&vser->init_mutex);
+    debug("vser->gcount=%d\n", vser->gcount);
+    debug("vser->gpus[i].name=%s\n", vser->gpus[vser->gcount-1]->prop.name);
     total_port = 0;
     cuError( cuInit(0));
     cuError( cuDeviceGetCount(&total_device) );
@@ -368,7 +375,6 @@ static void init_device(void)
         cuError( cuDeviceGet(&cudaDevices[i].device, i) );
         cuError( cuCtxCreate(&cudaDevices[i].context, 0, cudaDevices[i].device) );
         memset(&cudaDevices[i].cudaFunction, 0, sizeof(CUfunction) * CudaFunctionMaxNum);
-        cudaError( cudaGetDeviceProperties(&cudaDevices[i].prop, i) );
         cudaDevices[i].kernelsLoaded = 0;
     }
     cudaEventNum = 0;
@@ -378,11 +384,15 @@ static void init_device(void)
     memset(cudaStream, 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
 }
 
-static void deinit_device(void)
+static void deinit_device(VirtIOSerial *vser)
 {
-    if(!global_deinitialized)
+    qemu_mutex_lock(&vser->deinit_mutex);
+    if(global_deinitialized==0) {
+        qemu_mutex_unlock(&vser->deinit_mutex);
         return;
-    global_deinitialized=1;
+    }
+    global_deinitialized=0;
+    qemu_mutex_unlock(&vser->deinit_mutex);
     func();
     threadpool_destroy();
 }
@@ -978,7 +988,7 @@ static void *worker_threadproc(void *arg)
     int tid = port_id%total_port;
     debug("worker thread id=%d\n", tid);
     init_worker_context(port_id, device_id);
-    return NULL;
+
     while(1) {
         msg = message_queue_read(&worker_queue[tid]);
         switch(msg->cmd) {
@@ -1134,7 +1144,7 @@ static void virtconsole_enable_backend(VirtIOSerialPort *port, bool enable)
     debug("port id=%d, enable=%d\n", port->id, enable);
 
     if(!enable && global_deinitialized) {
-        deinit_device();
+        deinit_device(port->vser);
         return;
     }
     if(enable && !global_deinitialized)
@@ -1188,6 +1198,7 @@ static void virtconsole_realize(DeviceState *dev, Error **errp)
 {
     func();
     VirtIOSerialPort *port = VIRTIO_SERIAL_PORT(dev);
+    VirtIOSerial *vser = port->vser;
     VirtIOSerialPortClass *k = VIRTIO_SERIAL_PORT_GET_CLASS(dev);
     debug("port->id = %d\n", port->id );
     if (port->id == 0 && !k->is_console) {
@@ -1200,7 +1211,7 @@ static void virtconsole_realize(DeviceState *dev, Error **errp)
 
     /* init GPU device
     */
-    init_device();
+    init_device(vser);
 }
 
 /*
@@ -1211,7 +1222,6 @@ static void virtconsole_unrealize(DeviceState *dev, Error **errp)
 {
     func();
     VirtConsole *vcon = VIRTIO_CONSOLE(dev);
-
     if (vcon->watch) {
         g_source_remove(vcon->watch);
     }

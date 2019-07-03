@@ -28,6 +28,8 @@
 #include "trace.h"
 #include "hw/virtio/virtio-serial.h"
 #include "hw/virtio/virtio-access.h"
+#include "cuda.h"
+#include "cuda_runtime.h"
 
 #define func() printf("[FUNC]%s\n",__FUNCTION__)
 
@@ -213,10 +215,10 @@ static void handle_control_message(VirtIOSerial *vser, void *buf, size_t len)
     struct VirtIOSerialPort *port;
     VirtIOSerialPortClass *vsc;
     struct virtio_console_control cpkt, *gcpkt;
-    uint8_t *buffer;
+    uint8_t *buffer, *tmp;
     size_t buffer_len;
     int size;
-    const char *ctest="test";
+    int i=0;
 
     func();
     gcpkt = buf;
@@ -247,20 +249,21 @@ static void handle_control_message(VirtIOSerial *vser, void *buf, size_t len)
         }
         return;
     }
-    if (cpkt.event == VIRITO_CONSOLE_VGPU) {
-        printf("VIRITO_CONSOLE_VGPU\n");
-        virtio_stw_p(vdev, &cpkt.event, VIRITO_CONSOLE_VGPU);
-        virtio_stw_p(vdev, &cpkt.value, 1);
 
-        buffer_len = sizeof(cpkt) + sizeof(uint32_t) + 2*strlen(ctest);
+    if (cpkt.event == VIRTIO_CONSOLE_VGPU) {
+        printf("VIRTIO_CONSOLE_VGPU\n");
+        virtio_stw_p(vdev, &cpkt.event, VIRTIO_CONSOLE_VGPU);
+        virtio_stw_p(vdev, &cpkt.value, 1);
+        size = vser->gcount;
+        buffer_len = sizeof(cpkt)+sizeof(int)+size*sizeof(struct GPUDevice);
         buffer = g_malloc(buffer_len);
-        size = 2;
         memcpy(buffer, &cpkt, sizeof(cpkt));
         memcpy(buffer + sizeof(cpkt), &size, sizeof(size));
-        memcpy(buffer + sizeof(cpkt) + sizeof(uint32_t), ctest, strlen(ctest));
-        memcpy(buffer + sizeof(cpkt) + sizeof(uint32_t)+strlen(ctest), 
-            ctest, strlen(ctest));
-
+        tmp = buffer + sizeof(cpkt) + sizeof(uint32_t);
+        for(i=0; i<size; i++) {
+            memcpy(tmp, vser->gpus[i], sizeof(struct GPUDevice));
+            tmp = tmp + sizeof(struct GPUDevice);
+        }
         send_control_msg(vser, buffer, buffer_len);
         g_free(buffer);
         return;
@@ -759,9 +762,17 @@ static void virtio_cuda_device_unrealize(DeviceState *dev, Error **errp)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
     VirtIOSerial *vser = VIRTIO_CUDA(dev);
+    int i=0;
+    func();
 
     QLIST_REMOVE(vser, next);
 
+    qemu_mutex_destroy(&vser->init_mutex);
+    qemu_mutex_destroy(&vser->deinit_mutex);
+    for(i=0; i< vser->gcount; i++) {
+        g_free(vser->gpus[i]);
+    }
+    g_free(vser->gpus);
     g_free(vser->ivqs);
     g_free(vser->ovqs);
     g_free(vser->ports_map);
@@ -802,6 +813,9 @@ static void virtio_cuda_device_realize(DeviceState *dev, Error **errp)
     VirtIOSerial *vser = VIRTIO_CUDA(dev);
     uint32_t i, max_supported_ports;
     size_t config_size = sizeof(struct virtio_console_config);
+    int gcount=0;
+    cudaError_t err;
+    func();
 
     if (!vser->serial.max_virtserial_ports) {
         error_setg(errp, "Maximum number of serial ports not specified");
@@ -836,6 +850,26 @@ static void virtio_cuda_device_realize(DeviceState *dev, Error **errp)
     vser->ovqs = g_malloc(vser->serial.max_virtserial_ports
                           * sizeof(VirtQueue *));
 
+    qemu_mutex_init(&vser->init_mutex);
+    qemu_mutex_init(&vser->deinit_mutex);
+    err=cudaGetDeviceCount(&gcount);
+    if (err != cudaSuccess) {
+        error_setg(errp, "CUDA Runtime API Error = %s", 
+                        (char*)cudaGetErrorString(err));
+        return;
+    }
+    vser->gcount=gcount;
+    vser->gpus = g_malloc(gcount*sizeof(struct GPUDevice *));
+    for (i = 0; i < gcount; i++) {
+        vser->gpus[i] = (struct GPUDevice *)g_malloc(sizeof(struct GPUDevice));
+        vser->gpus[i]->device_id = i;
+        err = cudaGetDeviceProperties(&vser->gpus[i]->prop, i);
+        if (err != cudaSuccess) {
+            error_setg(errp, "CUDA Runtime API Error = %s", 
+                            (char*)cudaGetErrorString(err));
+            return;
+        }
+    }
     /* Add a queue for host to guest transfers for port 0 (backward compat) */
     vser->ivqs[0] = virtio_add_queue(vdev, 128, handle_input);
     /* Add a queue for guest to host transfers for port 0 (backward compat) */

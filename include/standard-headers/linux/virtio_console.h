@@ -74,6 +74,6 @@ struct virtio_console_control {
 #define VIRTIO_CONSOLE_PORT_OPEN	6
 #define VIRTIO_CONSOLE_PORT_NAME	7
 /* shared information between host and guest*/
-#define VIRITO_CONSOLE_VGPU 		8
+#define VIRTIO_CONSOLE_VGPU 		8
 
 #endif /* _LINUX_VIRTIO_CONSOLE_H */

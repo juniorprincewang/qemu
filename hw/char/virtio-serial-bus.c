@@ -351,7 +351,7 @@ static void handle_control_message(VirtIOSerial *vser, void *buf, size_t len)
     struct virtio_console_control cpkt, *gcpkt;
     uint8_t *buffer;
     size_t buffer_len;
-    func();
+    
     gcpkt = buf;
 
     if (len < sizeof(cpkt)) {
@@ -390,25 +390,8 @@ static void handle_control_message(VirtIOSerial *vser, void *buf, size_t len)
     trace_virtio_serial_handle_control_message_port(port->id);
 
     vsc = VIRTIO_SERIAL_PORT_GET_CLASS(port);
-    printf("event = %d\n", cpkt.event);
     
     switch(cpkt.event) {
-    case VIRITO_CONSOLE_VGPU:
-        printf("VIRITO_CONSOLE_VGPU\n");
-        virtio_stl_p(vdev, &cpkt.id, port->id);
-        virtio_stw_p(vdev, &cpkt.event, VIRITO_CONSOLE_VGPU);
-        virtio_stw_p(vdev, &cpkt.value, 1);
-
-        buffer_len = sizeof(cpkt) + strlen(port->name) + 1;
-        buffer = g_malloc(buffer_len);
-
-        memcpy(buffer, &cpkt, sizeof(cpkt));
-        memcpy(buffer + sizeof(cpkt), port->name, strlen(port->name));
-        buffer[buffer_len - 1] = 0;
-
-        send_control_msg(vser, buffer, buffer_len);
-        g_free(buffer);
-        break;
     case VIRTIO_CONSOLE_PORT_READY:
         if (!cpkt.value) {
             error_report("virtio-serial-bus: Guest failure in adding port %u for device %s",
