@@ -220,7 +220,7 @@ static void handle_control_message(VirtIOSerial *vser, void *buf, size_t len)
     int size;
     int i=0;
 
-    func();
+    // func();
     gcpkt = buf;
 
     if (len < sizeof(cpkt)) {
@@ -233,7 +233,7 @@ static void handle_control_message(VirtIOSerial *vser, void *buf, size_t len)
 
     trace_virtio_serial_handle_control_message(cpkt.event, cpkt.value);
 
-    printf("event = %d\n", cpkt.event);
+    // printf("event = %d\n", cpkt.event);
     if (cpkt.event == VIRTIO_CONSOLE_DEVICE_READY) {
         if (!cpkt.value) {
             error_report("virtio-serial-bus: Guest failure in adding device %s",
