@@ -292,22 +292,6 @@ static QemuThread worker_threads[WORKER_THREADS];
 
 static void *worker_processor(void *arg);
 
-static void threadpool_destroy(void) 
-{
-    int i =0;
-    for(i=0; i<total_port; ++i) {
-        VirtIOArg *poison = message_queue_message_alloc_blocking(&worker_queue[i]);
-        poison->cmd = VIRTIO_CUDA_CONFIGURECALL;
-        message_queue_write(&worker_queue[i], poison);
-    }
-    for(i=0; i<total_port; ++i) {
-        qemu_thread_join(&worker_threads[i]);
-    }
-    for(i=0; i<total_port; ++i) {
-        message_queue_destroy(&worker_queue[i]);
-    }
-}
-
 // static void load_module_kernel(int devID, void *fatBin, 
 //                 char *funcName, unsigned int funcID, int funcIndex)
 // {
@@ -406,11 +390,15 @@ static void deinit_device(VirtIOSerial *vser)
     qemu_mutex_unlock(&vser->deinit_mutex);
     func();
     qemu_mutex_destroy(&total_port_mutex);
-    threadpool_destroy();
+
+    debug("free cudaDevices stuff\n");
     i = total_device;
     while(i-- != 0) {
         pthread_spin_destroy(&cudaDevices[i].vol_lock);
-        list_del(&cudaDevices[i].vol);
+        // list_del(&cudaDevices[i].vol);
+        if ( memcmp(&zeroedDevice, &cudaDevices[i], sizeof(CudaDev)) != 0) {
+           cuError( cuCtxDestroy(cudaDevices[i].context) );
+        }
     }
     free(cudaDevices);
 }
@@ -512,7 +500,6 @@ static void cuda_launch(VirtIOArg *arg, int tid)
     uint32_t func_id, para_num, para_idx, func_idx;
     int dev_id;
     void **para_buf;
-    // unsigned int id = get_current_id( (unsigned int)arg->tid );
     uint32_t para_size, conf_size;
     hwaddr hw_para_size, hw_conf_size;
     // hwaddr gpa_para = (hwaddr)(arg->src);
@@ -1051,20 +1038,18 @@ static void cuda_gpa_to_hva(VirtIOArg *arg)
     arg->cmd = 1;//(int32_t)cudaSuccess;
 }
 
-static void init_worker_context(int port_id, int device_id)
+static void init_worker_context(int port_id, int dev_id)
 {
     func();
     int tid = port_id % total_port;
-    worker_cur_device[tid] = device_id;
-    cuError( cuCtxSetCurrent(cudaDevices[device_id].context) );
-    debug("thread %d => device %d\n", tid, device_id);
+    worker_cur_device[tid] = dev_id;
+    cuError( cuCtxSetCurrent(cudaDevices[dev_id].context) );
+    debug("thread %d => device %d\n", tid, dev_id);
 }
 
-static void deinit_worker_context(int device_id)
+static void deinit_worker_context(int dev_id)
 {
     func();
-    if ( memcmp(&zeroedDevice, &cudaDevices[device_id], sizeof(CudaDev)) != 0 )
-        cuError( cuCtxDestroy(cudaDevices[device_id].context) );
 }
 
 /*
@@ -1181,13 +1166,13 @@ static void *worker_processor(void *arg)
                 msg->cmd, _IOC_NR(msg->cmd));
             return NULL;
         }
+        message_queue_message_free(&worker_queue[tid], msg);
         ret = virtio_serial_write(port, (const uint8_t *)msg, sizeof(VirtIOArg));
         if (ret < sizeof(VirtIOArg)) {
             error("write error.\n");
             virtio_serial_throttle_port(port, true);
         }
         debug("[+] WRITE BACK\n");
-        message_queue_message_free(&worker_queue[tid], msg);
     }
     return NULL;
 }
@@ -1205,7 +1190,7 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
     int i;
     func();
 
-    debug("port->id=%d, buf=%6x, len=%ld\n", port->id, buf, len);
+    debug("port->id=%d, len=%ld\n", port->id, len);
     tid = port->id % total_port;
     for(i =0; i< len/sizeof(VirtIOArg); i++) {
         VirtIOArg *mq_block = message_queue_message_alloc_blocking(&worker_queue[tid]);
@@ -1237,11 +1222,24 @@ static void set_guest_connected(VirtIOSerialPort *port, int guest_connected)
  */
 static void virtconsole_enable_backend(VirtIOSerialPort *port, bool enable)
 {
+    int port_id = port->id;
+    int thread_id;
+    VirtIOArg *poison;
     func();
     debug("port id=%d, enable=%d\n", port->id, enable);
 
     if(!enable && global_deinitialized) {
-        deinit_device(port->vser);
+        if (!total_port)
+            return;
+        thread_id = port_id%total_port;
+        debug("Ending thread %d computing workloads and queue!\n",thread_id);
+        poison = message_queue_message_alloc_blocking(
+            &worker_queue[thread_id]);
+        poison->cmd = VIRTIO_CUDA_CONFIGURECALL;
+        message_queue_write(&worker_queue[thread_id], poison);
+        qemu_thread_join(&worker_threads[thread_id]);
+        message_queue_destroy(&worker_queue[thread_id]);
+        
         return;
     }
     if(enable && !global_deinitialized)
@@ -1261,7 +1259,7 @@ static void spawn_thread_by_port(VirtIOSerialPort *port)
     char thread_name[16];
     int port_id = port->id;
     int thread_id = port_id%total_port;
-    debug("Starting thread %d computing workloads!\n",thread_id);
+    debug("Starting thread %d computing workloads and queue!\n",thread_id);
     // initialize message queue for worker_threads[thread_id]
     message_queue_init(&worker_queue[thread_id], sizeof(VirtIOArg), 512);
     works[thread_id].device_id = (port_id-1)%total_device;
@@ -1326,6 +1324,9 @@ static void virtconsole_unrealize(DeviceState *dev, Error **errp)
 {
     func();
     VirtConsole *vcon = VIRTIO_CONSOLE(dev);
+    VirtIOSerialPort *port = VIRTIO_SERIAL_PORT(dev);
+    VirtIOSerial *vser = port->vser;
+    deinit_device(vser);
     if (vcon->watch) {
         g_source_remove(vcon->watch);
     }
