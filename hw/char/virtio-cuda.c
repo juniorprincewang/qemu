@@ -71,8 +71,8 @@ typedef struct VirtConsole {
 #define CudaFunctionName 128
 
 typedef struct VirtualObjectList {
-    void *addr;
-    void *v_addr;
+    uint64_t addr;
+    uint64_t v_addr;
     int size;
     struct list_head list;
 } VOL;
@@ -291,6 +291,7 @@ static struct message_queue worker_queue[WORKER_THREADS];
 static QemuThread worker_threads[WORKER_THREADS];
 
 static void *worker_processor(void *arg);
+static VOL *find_vol_by_vaddr(uint64_t vaddr, CudaDev *dev);
 
 // static void load_module_kernel(int devID, void *fatBin, 
 //                 char *funcName, unsigned int funcID, int funcIndex)
@@ -502,6 +503,7 @@ static void cuda_launch(VirtIOArg *arg, int tid)
     void **para_buf;
     uint32_t para_size, conf_size;
     hwaddr hw_para_size, hw_conf_size;
+    VOL *vol;
     // hwaddr gpa_para = (hwaddr)(arg->src);
     // hwaddr gpa_conf = (hwaddr)(arg->dst);
     func();
@@ -528,6 +530,7 @@ static void cuda_launch(VirtIOArg *arg, int tid)
         return ;
     }
     
+    dev_id = worker_cur_device[tid];
     /*
     char *para = (char *)malloc(para_size);
     cpu_physical_memory_read(gpa_para, para, para_size);
@@ -543,12 +546,16 @@ static void cuda_launch(VirtIOArg *arg, int tid)
     para_idx = sizeof(uint32_t);
     for(i=0; i<para_num; i++) {
         para_buf[i] = &para[para_idx + sizeof(uint32_t)];
+        vol = find_vol_by_vaddr(*(uint64_t*)para_buf[i], &cudaDevices[dev_id]);
+        if(vol!= NULL) {
+            debug("Found %lx\n", vol->addr);
+            para_buf[i] = &vol->addr;
+        }
         debug("arg %d = 0x%llx , size=%u byte\n", i, 
             *(unsigned long long*)para_buf[i], *(unsigned int*)(&para[para_idx]));
         para_idx += *(uint32_t*)(&para[para_idx]) + sizeof(uint32_t);
     }
     int found = 0;
-    dev_id = worker_cur_device[tid];
     for(func_idx=0; func_idx < cudaFunctionNum[tid]; func_idx++) {
         if( cudaDevices[dev_id].kernel_func_id[func_idx] 
                     == func_id) {
@@ -560,11 +567,10 @@ static void cuda_launch(VirtIOArg *arg, int tid)
         error("Failed to find func id.\n");
         free(para_buf);
         return;
-    } else {
-        debug("Found func_idx = %d.\n", func_idx);
-        debug("Found function  = %lu.\n", 
-            (uint64_t)(cudaDevices[dev_id].kernel_func[func_idx]));
     }
+    debug("Found func_idx = %d.\n", func_idx);
+    debug("Found function  = %lu.\n", 
+            (uint64_t)(cudaDevices[dev_id].kernel_func[func_idx]));
 
     debug("gridDim=%u %u %u\n", conf->gridDim.x, 
         conf->gridDim.y, conf->gridDim.z);
@@ -586,7 +592,7 @@ static void cuda_launch(VirtIOArg *arg, int tid)
     para_buf = NULL;
 }
 
-static VOL *find_vol_by_vaddr(void *vaddr, CudaDev *dev)
+static VOL *find_vol_by_vaddr(uint64_t vaddr, CudaDev *dev)
 {
     VOL *vol;
     pthread_spin_lock(&dev->vol_lock);
@@ -622,7 +628,7 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
                                 arg->src, size);
             return ;
         }
-        vol = find_vol_by_vaddr((void *)arg->dst, &cudaDevices[dev_id]);
+        vol = find_vol_by_vaddr(arg->dst, &cudaDevices[dev_id]);
         if(vol == NULL) {
             error("Failed to find virtual address %p in vol\n", (void *)arg->dst);
             return;
@@ -631,10 +637,10 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
             error("Failed to match size in vol\n");
             return;
         }
-        dst = vol->addr;
+        dst = (void *)vol->addr;
         cuError( (err= cuMemcpyHtoD((CUdeviceptr)dst, (void *)src, size)));
     } else if (arg->flag == cudaMemcpyDeviceToHost) {
-        vol = find_vol_by_vaddr((void *)arg->src, &cudaDevices[dev_id]);
+        vol = find_vol_by_vaddr(arg->src, &cudaDevices[dev_id]);
         if(vol == NULL) {
             error("Failed to find virtual address %p in vol\n", (void *)arg->src);
             return;
@@ -643,7 +649,7 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
             error("Failed to match size in vol\n");
             return;
         }
-        src = vol->addr;
+        src = (void*)vol->addr;
 
         hwaddr dst_len = (hwaddr)size;
         // gpa => hva
@@ -658,7 +664,7 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
         cuError( (err=cuMemcpyDtoH((void *)dst, (CUdeviceptr)src, size)) );
         // err = 0;
     } else if (arg->flag == cudaMemcpyDeviceToDevice) {
-        vol = find_vol_by_vaddr((void *)arg->src, &cudaDevices[dev_id]);
+        vol = find_vol_by_vaddr(arg->src, &cudaDevices[dev_id]);
         if(vol == NULL) {
             error("Failed to find virtual address %p in vol\n", (void *)arg->src);
             return;
@@ -667,8 +673,8 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
             error("Failed to match size in vol\n");
             return;
         }
-        src = vol->addr;
-        vol = find_vol_by_vaddr((void *)arg->dst, &cudaDevices[dev_id]);
+        src = (void*)vol->addr;
+        vol = find_vol_by_vaddr(arg->dst, &cudaDevices[dev_id]);
         if(vol == NULL) {
             error("Failed to find virtual address %p in vol\n", (void *)arg->dst);
             return;
@@ -677,7 +683,7 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
             error("Failed to match size in vol\n");
             return;
         }
-        dst = vol->addr;
+        dst = (void*)vol->addr;
         cuError( (err=cuMemcpyDtoD((CUdeviceptr)dst, (CUdeviceptr)src, size)) );
     }
     arg->cmd = err;
@@ -759,7 +765,7 @@ static void cuda_malloc(VirtIOArg *arg, int tid)
     cudaError_t err;
     void *devPtr;
     uint32_t size;
-    VOL *mem_obj;
+    VOL *vol;
     int dev_id = worker_cur_device[tid];
     func();
 
@@ -767,31 +773,33 @@ static void cuda_malloc(VirtIOArg *arg, int tid)
     initialize_device(tid);
     size = arg->srcSize;
     cudaError( (err= cudaMalloc(&devPtr, size)));
-    mem_obj = (VOL *)malloc(sizeof(VOL));
-    mem_obj->addr = mem_obj->v_addr = devPtr;
-    arg->dst =  (uint64_t)(mem_obj->v_addr);
-    mem_obj->size = size;
+    vol = (VOL *)malloc(sizeof(VOL));
+    vol->addr = (uint64_t)devPtr;
+    vol->v_addr = (uint64_t)(devPtr + 0x1000);
+    arg->dst =  (uint64_t)(vol->v_addr);
+    vol->size = size;
     pthread_spin_lock(&cudaDevices[dev_id].vol_lock);
-    list_add_tail(&mem_obj->list, &cudaDevices[dev_id].vol);
+    list_add_tail(&vol->list, &cudaDevices[dev_id].vol);
     pthread_spin_unlock(&cudaDevices[dev_id].vol_lock);
     arg->cmd = err;
-    debug(" devPtr=0x%lx, size=%d, return value=%d\n", arg->dst, size, err);
+    debug(" actual devPtr=0x%lx, virtual ptr=0x%lx, size=%d, return value=%d\n", 
+        (uint64_t)devPtr, arg->dst, size, err);
 }
 
 static void cuda_free(VirtIOArg *arg, int tid)
 {
     cudaError_t err;
-    void *src;
+    uint64_t src;
     VOL *vol, *vol2;
     int dev_id = worker_cur_device[tid];
     func();
     // in case of cudaReset
     initialize_device(tid);
-    src = (void*)(arg->src);
+    src = (arg->src);
     debug(" ptr = 0x%lx\n", arg->src);
     list_for_each_entry_safe(vol, vol2, &cudaDevices[dev_id].vol, list) {
         if (vol->v_addr == src) {
-            cudaError( (err= cudaFree(vol->addr)) );
+            cudaError( (err= cudaFree((void*)(vol->addr))) );
             pthread_spin_lock(&cudaDevices[dev_id].vol_lock);
             list_del(&vol->list);
             pthread_spin_unlock(&cudaDevices[dev_id].vol_lock);
