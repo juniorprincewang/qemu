@@ -68,7 +68,6 @@ typedef struct VirtConsole {
 #define CudaFunctionMaxNum 1024
 #define CudaEventMaxNum 32
 #define CudaStreamMaxNum 32
-#define CudaFunctionName 128
 
 typedef struct VirtualObjectList {
     uint64_t addr;
@@ -80,16 +79,15 @@ typedef struct VirtualObjectList {
 typedef struct CudaDev {
     CUdevice device;
     CUcontext context;
-    unsigned int kernel_func_id[CudaFunctionMaxNum];
-    CUfunction kernel_func[CudaFunctionMaxNum];
-    CUmodule module;
     struct list_head vol;
     pthread_spinlock_t vol_lock;
 }CudaDev;
 
 typedef struct KernelInfo {
     void *fatBin;
-    char func_name[CudaFunctionName];
+    CUmodule module;
+    CUfunction kernel_func;
+    char *func_name;
     uint32_t func_id;
 } KernelInfo;
 
@@ -293,18 +291,6 @@ static QemuThread worker_threads[WORKER_THREADS];
 static void *worker_processor(void *arg);
 static VOL *find_vol_by_vaddr(uint64_t vaddr, CudaDev *dev);
 
-// static void load_module_kernel(int devID, void *fatBin, 
-//                 char *funcName, unsigned int funcID, int funcIndex)
-// {
-//     func();
-//     debug("Loading module... fatBin=%16p, name=%s, funcID=%d\n", 
-//             fatBin, funcName, funcID);
-//     cuError( cuModuleLoadData(&cudaDevices[devID].module, fatBin) );
-//     cuError( cuModuleGetFunction(&cudaDevices[devID].kernel_func[funcIndex], 
-//         cudaDevices[devID].module, funcName) );
-//     cudaDevices[devID].kernel_func_id[funcIndex] = funcID;
-// }
-
 static cudaError_t initialize_device(unsigned int tid)
 {
     int dev = worker_cur_device[tid];
@@ -368,7 +354,6 @@ static void init_device(VirtIOSerial *vser)
         memset(&cudaDevices[i], 0, sizeof(CudaDev));
         cuError( cuDeviceGet(&cudaDevices[i].device, i) );
         cuError( cuCtxCreate(&cudaDevices[i].context, 0, cudaDevices[i].device) );
-        memset(&cudaDevices[i].kernel_func, 0, sizeof(CUfunction) * CudaFunctionMaxNum);
         INIT_LIST_HEAD(&cudaDevices[i].vol);
         pthread_spin_init(&cudaDevices[i].vol_lock, PTHREAD_PROCESS_PRIVATE);
     }
@@ -442,10 +427,11 @@ static void cuda_unregister_fatinary(VirtIOArg *arg, int tid)
     func();
     for(f_idx=0; f_idx<cudaFunctionNum[tid]; f_idx++) {
         free(devicesKernels[tid][f_idx].fatBin);
-        devicesKernels[tid][f_idx].fatBin = NULL;
-        memset(devicesKernels[tid][f_idx].func_name, 0, 
-            sizeof(devicesKernels[tid][f_idx].func_name));
+        free(devicesKernels[tid][f_idx].func_name);
+        memset(&devicesKernels[tid][f_idx], 0, 
+            sizeof(devicesKernels[tid][f_idx]));
     }
+    cudaFunctionNum[tid] = 0;
 }
 
 static void cuda_register_function(VirtIOArg *arg, int tid)
@@ -455,35 +441,42 @@ static void cuda_register_function(VirtIOArg *arg, int tid)
     uint32_t func_id;
     uint32_t fat_size, name_size;
     int nr_func = cudaFunctionNum[tid];
-    int dev_id;
+    KernelInfo *kernel;
     func();
+
+    if(nr_func >= CudaFunctionMaxNum) {
+        error("kernel number of thread %d is overflow.\n", tid);
+        arg->cmd = cudaErrorUnknown;
+        return;
+    }
+
     fat_bin_gpa = (hwaddr)(arg->src);
     func_name_gpa = (hwaddr)(arg->dst);
     func_id = arg->flag;
     fat_size = arg->srcSize;
     name_size = arg->dstSize;
     // initialize the KernelInfo
-    devicesKernels[tid][nr_func].fatBin = malloc(fat_size);
+    kernel = &devicesKernels[tid][nr_func];
+    kernel->fatBin = malloc(fat_size);
+    kernel->func_name = malloc(name_size);
 
-    cpu_physical_memory_read(fat_bin_gpa, \
-        devicesKernels[tid][nr_func].fatBin, fat_size);
-    cpu_physical_memory_read(func_name_gpa, \
-        devicesKernels[tid][nr_func].func_name, name_size);
+    cpu_physical_memory_read(fat_bin_gpa,
+        kernel->fatBin, fat_size);
+    cpu_physical_memory_read(func_name_gpa,
+        kernel->func_name, name_size);
 
-    devicesKernels[tid][nr_func].func_id = func_id;
+    kernel->func_id = func_id;
     debug("Loading module... fatBin = %16p, name='%s',"
             " func_id=%d, nr_func = %d\n", 
-        devicesKernels[tid][nr_func].fatBin, \
-        (char*)devicesKernels[tid][nr_func].func_name, \
-        func_id, \
-        nr_func);
-    dev_id = worker_cur_device[tid];
-    cuError( cuModuleLoadData(&cudaDevices[dev_id].module, 
-                            devicesKernels[tid][nr_func].fatBin) );
-    cuError( cuModuleGetFunction(&cudaDevices[dev_id].kernel_func[nr_func], \
-                                    cudaDevices[dev_id].module, \
-                            (char*)devicesKernels[tid][nr_func].func_name) );
-    cudaDevices[dev_id].kernel_func_id[nr_func] = func_id;
+            kernel->fatBin,
+            kernel->func_name,
+            func_id,
+            nr_func);
+    cuError( cuModuleLoadData(&kernel->module, kernel->fatBin) );
+    cuError( cuModuleGetFunction(
+        &kernel->kernel_func,
+        kernel->module,
+        kernel->func_name) );
     cudaFunctionNum[tid]++;
     arg->cmd = cudaSuccess;
 }
@@ -514,7 +507,8 @@ static void cuda_launch(VirtIOArg *arg, int tid)
     hw_para_size = (hwaddr)para_size;
     hw_conf_size = (hwaddr)conf_size;
 
-    char *para = (char *)cpu_physical_memory_map((hwaddr)(arg->src), &hw_para_size, 0);
+    char *para = (char *)cpu_physical_memory_map(
+                    (hwaddr)(arg->src), &hw_para_size, 0);
     if (!para || hw_para_size != para_size) {
         error("Failed to map MMIO memory for"
                           " gpa 0x%lx element size %u\n",
@@ -552,13 +546,13 @@ static void cuda_launch(VirtIOArg *arg, int tid)
             para_buf[i] = &vol->addr;
         }
         debug("arg %d = 0x%llx , size=%u byte\n", i, 
-            *(unsigned long long*)para_buf[i], *(unsigned int*)(&para[para_idx]));
+            *(unsigned long long*)para_buf[i], 
+            *(unsigned int*)(&para[para_idx]));
         para_idx += *(uint32_t*)(&para[para_idx]) + sizeof(uint32_t);
     }
     int found = 0;
     for(func_idx=0; func_idx < cudaFunctionNum[tid]; func_idx++) {
-        if( cudaDevices[dev_id].kernel_func_id[func_idx] 
-                    == func_id) {
+        if( devicesKernels[tid][func_idx].func_id == func_id) {
             found = 1;
             break;
         }
@@ -570,7 +564,7 @@ static void cuda_launch(VirtIOArg *arg, int tid)
     }
     debug("Found func_idx = %d.\n", func_idx);
     debug("Found function  = %lu.\n", 
-            (uint64_t)(cudaDevices[dev_id].kernel_func[func_idx]));
+            (uint64_t)devicesKernels[tid][func_idx].func_id);
 
     debug("gridDim=%u %u %u\n", conf->gridDim.x, 
         conf->gridDim.y, conf->gridDim.z);
@@ -578,12 +572,9 @@ static void cuda_launch(VirtIOArg *arg, int tid)
         conf->blockDim.y, conf->blockDim.z);
     debug("sharedMem=%ld\n", conf->sharedMem);
     debug("stream=%lu\n", (uint64_t)(conf->stream));
-    /*
-    cudaError( (err= cudaConfigureCall(conf->gridDim, 
-        conf->blockDim, conf->sharedMem, conf->stream)));
-    */
+
     cuError( (err = cuLaunchKernel(
-        cudaDevices[dev_id].kernel_func[func_idx], \
+        devicesKernels[tid][func_idx].kernel_func, \
         conf->gridDim.x, conf->gridDim.y, conf->gridDim.z,\
         conf->blockDim.x, conf->blockDim.y, conf->blockDim.z,\
         conf->sharedMem, conf->stream, para_buf, NULL) ) );
@@ -1294,8 +1285,10 @@ static void virtconsole_guest_ready(VirtIOSerialPort *port)
     qemu_mutex_lock(&total_port_mutex);
     total_port = get_active_ports_nr(vser);
     qemu_mutex_unlock(&total_port_mutex);
-    // debug("nr active ports =%d\n", total_port);
-
+    if( total_port > WORKER_THREADS) {
+        error("Too much ports, over %d\n", WORKER_THREADS);
+        return;
+    }
     spawn_thread_by_port(port);
     return;
 }
@@ -1322,6 +1315,7 @@ static void virtconsole_realize(DeviceState *dev, Error **errp)
     /* init GPU device
     */
     init_device(vser);
+
 }
 
 /*
