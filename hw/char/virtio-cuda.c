@@ -26,6 +26,7 @@
 
 #include "virtio-ioc.h"
 #include "message_queue.h"
+#include "memorypool.h"
 #include "list.h"
 
 #include <openssl/hmac.h> // hmac EVP_MAX_MD_SIZE
@@ -33,7 +34,12 @@
 #include <openssl/bio.h>
 #include <openssl/evp.h>
 #include <openssl/buffer.h>
-#include <stdint.h>
+#include <stdint.h> // uint32_t ...
+#include <limits.h> // CHAR_BIT , usually 8
+
+#ifndef min
+#define min(a,b)    (((a)<(b)) ? (a) : (b))
+#endif
 
 // #define VIRTIO_CUDA_DEBUG
 #ifdef VIRTIO_CUDA_DEBUG
@@ -57,6 +63,17 @@
 #define WORKER_THREADS 32
 #endif
 
+/* bitmap */
+typedef uint32_t word_t;
+enum{BITS_PER_WORD = sizeof(word_t) * CHAR_BIT}; // BITS_PER_WORD=32
+#define WORD_OFFSET(b) ((b)/BITS_PER_WORD)
+#define BIT_OFFSET(b) ((b)%BITS_PER_WORD)
+
+
+static const mem_size_t max_mem = 2 * GB ;
+static const mem_size_t mem_pool_size = 1 * GB ;
+static MemoryPool* mpool;
+
 typedef struct VirtConsole {
     VirtIOSerialPort parent_obj;
     char *privatekeypath;    
@@ -66,8 +83,8 @@ typedef struct VirtConsole {
 } VirtConsole;
 
 #define CudaFunctionMaxNum 1024
-#define CudaEventMaxNum 32
-#define CudaStreamMaxNum 32
+#define CudaEventMaxNum BITS_PER_WORD
+#define CudaStreamMaxNum BITS_PER_WORD
 
 typedef struct VirtualObjectList {
     uint64_t addr;
@@ -109,10 +126,9 @@ CUdevice worker_cur_device[WORKER_THREADS];
 KernelInfo devicesKernels[WORKER_THREADS][CudaFunctionMaxNum];
 
 cudaEvent_t cudaEvent[WORKER_THREADS][CudaEventMaxNum];
-uint32_t cudaEventNum[WORKER_THREADS];
+word_t cudaEventBitmap[WORKER_THREADS];
 cudaStream_t cudaStream[WORKER_THREADS][CudaStreamMaxNum];
-uint32_t cudaStreamNum[WORKER_THREADS];
-int version;
+word_t cudaStreamBitmap[WORKER_THREADS];
 
 
 static int global_initialized = 0;
@@ -281,7 +297,6 @@ typedef struct Workload
 {
     int device_id;
     VirtIOSerialPort *port;
-    cudaStream_t stream;
 } Workload;
 
 Workload works[WORKER_THREADS];
@@ -311,6 +326,27 @@ static unsigned int get_current_id(unsigned int tid)
 {
     return tid%total_device;
 }
+
+/*
+* bitmap
+#include <limits.h> // for CHAR_BIT
+*/
+static void __set_bit(word_t *word, int n)
+{
+    word[WORD_OFFSET(n)] |= (1 << BIT_OFFSET(n));
+}
+
+static void __clear_bit(word_t *word, int n)
+{
+    word[WORD_OFFSET(n)] &= ~(1 << BIT_OFFSET(n));
+}
+
+static int __get_bit(word_t *word, int n)
+{
+    word_t bit = word[WORD_OFFSET(n)] & (1 << BIT_OFFSET(n));
+    return bit != 0;
+}
+
 
 /*
 static void *memdup(const void *src, size_t n)
@@ -345,7 +381,6 @@ static void init_device(VirtIOSerial *vser)
         debug("vser->gcount=%d\n", vser->gcount);
         total_device = vser->gcount;
     }
-    cuError( cuDriverGetVersion(&version) );
     cudaDevices = (CudaDev *)malloc(total_device * sizeof(CudaDev));
     memset(&zeroedDevice, 0, sizeof(CudaDev));
     i = total_device;
@@ -357,10 +392,9 @@ static void init_device(VirtIOSerial *vser)
         INIT_LIST_HEAD(&cudaDevices[i].vol);
         pthread_spin_init(&cudaDevices[i].vol_lock, PTHREAD_PROCESS_PRIVATE);
     }
-    memset(cudaEventNum, 0, sizeof(cudaEventNum));
-    memset(cudaStreamNum, 0, sizeof(cudaStreamNum));
-    memset(cudaEvent, 0, sizeof(cudaEvent_t)*CudaEventMaxNum);
-    memset(cudaStream, 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
+
+    mpool = MemoryPool_Init(max_mem, mem_pool_size, 1); // thread safe
+    cudaError(cudaHostRegister((void*)mpool->mlist, mem_pool_size, cudaHostAllocMapped));
 }
 
 static void deinit_device(VirtIOSerial *vser)
@@ -386,24 +420,32 @@ static void deinit_device(VirtIOSerial *vser)
         }
     }
     free(cudaDevices);
+    cudaError(cudaHostUnregister((void*)mpool->mlist));
+    MemoryPool_Clear(mpool);
+    MemoryPool_Destroy(mpool);
+}
+
+static void *gpa_to_hva(hwaddr gpa, int len)
+{
+    hwaddr size = (hwaddr)len;
+    void *hva = cpu_physical_memory_map(gpa, &size, 0);
+    if (!hva || len != size) {
+        error("Failed to map MMIO memory for"
+                          " gpa 0x%lx element size %u\n",
+                            gpa, len);
+        return NULL;
+    }
+    return hva;
 }
 
 static void cuda_register_fatbinary(VirtIOArg *arg)
 {
     void *fat_bin;
-    hwaddr gpa;
     uint32_t src_size = arg->srcSize;
     func();
     // check out hmac
-    gpa = (hwaddr)(arg->src);
-    hwaddr src_len = (hwaddr)src_size;
-    fat_bin = cpu_physical_memory_map(gpa, &src_len, 0);
-    if (!fat_bin || src_len != src_size) {
-        error("Failed to map MMIO memory for"
-                          " gpa 0x%lx element size %u\n",
-                            gpa, src_size);
-        return ;
-    }
+    if( (fat_bin=gpa_to_hva((hwaddr)(arg->src), src_size))==NULL)
+        return;
     debug("fat_bin is 0x%lx\n", *(uint64_t*)fat_bin);
     //    fatBinAddr = gpa_to_hva(arg->addr1);
     //  cpu_physical_memory_rws(arg->addr1, fatBinAddr, len, 0);
@@ -492,10 +534,10 @@ static void cuda_launch(VirtIOArg *arg, int tid)
     int i=0;
     uint32_t func_id, para_num, para_idx, func_idx;
     int dev_id;
-    void **para_buf;
+    void **para_buf=NULL;
     uint32_t para_size, conf_size;
-    hwaddr hw_para_size, hw_conf_size;
-    VOL *vol;
+    VOL *vol=NULL;
+    cudaStream_t stream;
     // hwaddr gpa_para = (hwaddr)(arg->src);
     // hwaddr gpa_conf = (hwaddr)(arg->dst);
     func();
@@ -503,26 +545,12 @@ static void cuda_launch(VirtIOArg *arg, int tid)
     para_size = arg->srcSize;
     conf_size = arg->dstSize;
     
-    hw_para_size = (hwaddr)para_size;
-    hw_conf_size = (hwaddr)conf_size;
+    char *para = (char *)gpa_to_hva((hwaddr)(arg->src), para_size);
+    if (!para ) return ;
+    KernelConf_t *conf = (KernelConf_t*)gpa_to_hva((hwaddr)arg->dst, 
+                                                   conf_size);
+    if (!conf) return ;
 
-    char *para = (char *)cpu_physical_memory_map(
-                    (hwaddr)(arg->src), &hw_para_size, 0);
-    if (!para || hw_para_size != para_size) {
-        error("Failed to map MMIO memory for"
-                          " gpa 0x%lx element size %u\n",
-                            arg->src, para_size);
-        return ;
-    }
-    KernelConf_t *conf = (KernelConf_t*)cpu_physical_memory_map(\
-        (hwaddr)(arg->dst), &hw_conf_size, 0);
-    if (!conf || hw_conf_size != conf_size) {
-        error("Failed to map MMIO memory for"
-                          " gpa 0x%lx element size %u\n",
-                            arg->dst, conf_size);
-        return ;
-    }
-    
     dev_id = worker_cur_device[tid];
     /*
     char *para = (char *)malloc(para_size);
@@ -545,8 +573,8 @@ static void cuda_launch(VirtIOArg *arg, int tid)
             para_buf[i] = &vol->addr;
         }
         debug("arg %d = 0x%llx , size=%u byte\n", i, 
-            *(unsigned long long*)para_buf[i], 
-            *(unsigned int*)(&para[para_idx]));
+              *(unsigned long long*)para_buf[i], 
+              *(unsigned int*)(&para[para_idx]));
         para_idx += *(uint32_t*)(&para[para_idx]) + sizeof(uint32_t);
     }
     int found = 0;
@@ -563,20 +591,34 @@ static void cuda_launch(VirtIOArg *arg, int tid)
     }
     debug("Found func_idx = %d.\n", func_idx);
     debug("Found function  = %lu.\n", 
-            (uint64_t)devicesKernels[tid][func_idx].func_id);
-
+          (uint64_t)devicesKernels[tid][func_idx].func_id);
     debug("gridDim=%u %u %u\n", conf->gridDim.x, 
-        conf->gridDim.y, conf->gridDim.z);
-    debug("blockDim=%u %u %u\n", conf->blockDim.x, 
-        conf->blockDim.y, conf->blockDim.z);
+          conf->gridDim.y, conf->gridDim.z);
+    debug("blockDim=%u %u %u\n", conf->blockDim.x,
+          conf->blockDim.y, conf->blockDim.z);
     debug("sharedMem=%ld\n", conf->sharedMem);
     debug("stream=%lu\n", (uint64_t)(conf->stream));
 
-    cuError( (err = cuLaunchKernel(
-        devicesKernels[tid][func_idx].kernel_func, \
-        conf->gridDim.x, conf->gridDim.y, conf->gridDim.z,\
-        conf->blockDim.x, conf->blockDim.y, conf->blockDim.z,\
-        conf->sharedMem, conf->stream, para_buf, NULL) ) );
+    if(!((uint64_t)conf->stream))
+        stream = cudaStream[tid][0];
+    else {
+        int pos=(uint64_t)conf->stream;
+        if (__get_bit(&cudaStreamBitmap[tid], pos-1)) {
+            error("No such stream, pos=%d\n", pos);
+            arg->cmd=cudaErrorLaunchFailure;
+            return;
+        }
+        stream = cudaStream[tid][pos-1];
+    }
+    debug("now stream=%lu\n", (uint64_t)(stream));
+    cuError( (err = cuLaunchKernel(devicesKernels[tid][func_idx].kernel_func,
+                    conf->gridDim.x, conf->gridDim.y, conf->gridDim.z,
+                    conf->blockDim.x, conf->blockDim.y, conf->blockDim.z,
+                    conf->sharedMem, stream, para_buf, NULL) ) );
+    // cudaError(err=cudaLaunchKernel(devicesKernels[tid][func_idx].kernel_func,
+    //                                conf->gridDim, conf->blockDim, para_buf,
+    //                                conf->sharedMem, 
+    //                                stream));
     arg->cmd = err;
     free(para_buf);
     para_buf = NULL;
@@ -596,27 +638,53 @@ out:
     return vol;
 }
 
+
+
 static void cuda_memcpy(VirtIOArg *arg, int tid)
 {
     cudaError_t err;
     uint32_t size;
     void *src, *dst;
-    VOL *vol;
+    VOL *vol=NULL;
+    uint64_t *gpa_array=NULL;
+    int len=0;
+    int i=0;
     int dev_id = worker_cur_device[tid];
     func();
     // in case cudaDeviceReset was the previous call
     initialize_device(tid);
-    debug("src=0x%lx, srcSize=%d, dst=0x%lx, dstSize=%d, kind=%lu\n",
-        arg->src, arg->srcSize, arg->dst, arg->dstSize, arg->flag);
+    debug("src=0x%lx, srcSize=0x%u, dst=0x%lx, "
+          "dstSize=0x%u, kind=0x%lu, param=0x%lu\n",
+          arg->src, arg->srcSize, arg->dst, 
+          arg->dstSize, arg->flag, arg->param);
     size = arg->srcSize;
     if (arg->flag == cudaMemcpyHostToDevice) {
-        hwaddr src_len = (hwaddr)size;
-        src = cpu_physical_memory_map(arg->src, &src_len, 0);
-        if (!src || src_len != size) {
-            error("Failed to map MMIO memory for"
-                              " gpa 0x%lx element size %u\n",
-                                arg->src, size);
-            return ;
+        src = MemoryPool_Alloc(mpool, size);
+        if(arg->param) {
+            int blocks = arg->param;
+            gpa_array = (uint64_t*)gpa_to_hva((hwaddr)arg->src, blocks);
+            if(!gpa_array) {
+                MemoryPool_Free(mpool, src);
+                return;
+            }
+            uint32_t offset = arg->dstSize;
+            uint32_t start_offset = offset % KMALLOC_SIZE;
+            len = min(size, KMALLOC_SIZE - start_offset);
+            cpu_physical_memory_read((hwaddr)gpa_array[0], src, len);
+            int rsize=size;
+            rsize-=len;
+            offset=len;
+            i=1;
+            while(rsize) {
+                len=min(rsize, KMALLOC_SIZE);
+                cpu_physical_memory_read((hwaddr)gpa_array[i++],
+                                         src+offset, len);
+                offset+=len;
+                rsize-=len;
+            }
+            assert(i == blocks);
+        } else {
+            cpu_physical_memory_read((hwaddr)arg->src, src, size);
         }
         vol = find_vol_by_vaddr(arg->dst, &cudaDevices[dev_id]);
         if(vol == NULL) {
@@ -628,8 +696,14 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
             return;
         }
         dst = (void *)vol->addr;
-        cuError( (err= cuMemcpyHtoD((CUdeviceptr)dst, (void *)src, size)));
+        /* use stream to asynchronize transferring data*/
+        cuError( (err= cuMemcpyHtoDAsync((CUdeviceptr)dst, src, 
+                                         size, cudaStream[tid][0])));
+        MemoryPool_Free(mpool, src);
     } else if (arg->flag == cudaMemcpyDeviceToHost) {
+        // get host address
+        dst = MemoryPool_Alloc(mpool, size);
+        // get device address
         vol = find_vol_by_vaddr(arg->src, &cudaDevices[dev_id]);
         if(vol == NULL) {
             error("Failed to find virtual addr %p in vol\n", (void *)arg->src);
@@ -640,19 +714,36 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
             return;
         }
         src = (void*)vol->addr;
-
-        hwaddr dst_len = (hwaddr)size;
-        // gpa => hva
-        dst = cpu_physical_memory_map(arg->dst, &dst_len, 0);
-        if (!dst || dst_len != size) {
-            error("Failed to map MMIO memory for"
-                              " gpa 0x%lx element size %u\n",
-                                arg->dst, size);
-            return ;
+        cuError( (err=cuMemcpyDtoHAsync(dst, (CUdeviceptr)src, 
+                                        size, cudaStream[tid][0])) );
+        // copy back to VM
+        if(arg->param) {
+            int blocks = arg->param;
+            gpa_array = (uint64_t*)gpa_to_hva((hwaddr)arg->dst, blocks);
+            if(!gpa_array) {
+                MemoryPool_Free(mpool, dst);
+                return;
+            }
+            uint32_t offset = arg->dstSize;
+            uint32_t start_offset = offset % KMALLOC_SIZE;
+            len = min(size, KMALLOC_SIZE - start_offset);
+            cpu_physical_memory_write((hwaddr)gpa_array[0], dst, len);
+            int rsize=size;
+            rsize-=len;
+            offset=len;
+            i=1;
+            while(rsize) {
+                len=min(rsize, KMALLOC_SIZE);
+                cpu_physical_memory_write((hwaddr)gpa_array[i++], 
+                                          dst+offset, len);
+                offset+=len;
+                rsize-=len;
+            }
+            assert(i == blocks);
+        } else {
+            cpu_physical_memory_write((hwaddr)arg->dst, dst, size);
         }
-        //testOver4K(buf, size);
-        cuError( (err=cuMemcpyDtoH((void *)dst, (CUdeviceptr)src, size)) );
-        // err = 0;
+        MemoryPool_Free(mpool, dst);
     } else if (arg->flag == cudaMemcpyDeviceToDevice) {
         vol = find_vol_by_vaddr(arg->src, &cudaDevices[dev_id]);
         if(vol == NULL) {
@@ -674,7 +765,8 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
             return;
         }
         dst = (void*)vol->addr;
-        cuError( (err=cuMemcpyDtoD((CUdeviceptr)dst, (CUdeviceptr)src, size)) );
+        cuError( (err=cuMemcpyDtoDAsync((CUdeviceptr)dst, (CUdeviceptr)src,
+                                        size, cudaStream[tid][0])) );
     }
     arg->cmd = err;
     debug(" return value=%d\n", err);
@@ -696,14 +788,8 @@ static void cuda_memcpy_async(VirtIOArg *arg, int tid)
         arg->src, arg->srcSize, arg->dst, arg->dstSize, arg->flag, arg->param);
     size = arg->srcSize;
     if (arg->flag == cudaMemcpyHostToDevice) {
-        hwaddr src_len = (hwaddr)size;
-        src = cpu_physical_memory_map(arg->src, &src_len, 0);
-        if (!src || src_len != size) {
-            error("Failed to map MMIO memory for"
-                              " gpa 0x%lx element size %u\n",
-                                arg->src, size);
-            return ;
-        }
+        if(!(src=gpa_to_hva((hwaddr)arg->src, size)))
+            return;
         vol = find_vol_by_vaddr(arg->dst, &cudaDevices[dev_id]);
         if(vol == NULL) {
             error("Failed to find virtual addr %p in vol\n", (void *)arg->dst);
@@ -714,8 +800,8 @@ static void cuda_memcpy_async(VirtIOArg *arg, int tid)
             return;
         }
         dst = (void *)vol->addr;
-        cuError( (err= cuMemcpyHtoDAsync((CUdeviceptr)dst, \
-                                        (void *)src, size, cudaStream[tid][idx])));
+        cuError( (err= cuMemcpyHtoDAsync((CUdeviceptr)dst, (void *)src, size, 
+                                         cudaStream[tid][idx])));
     } else if (arg->flag == cudaMemcpyDeviceToHost) {
         vol = find_vol_by_vaddr(arg->src, &cudaDevices[dev_id]);
         if(vol == NULL) {
@@ -727,20 +813,10 @@ static void cuda_memcpy_async(VirtIOArg *arg, int tid)
             return;
         }
         src = (void*)vol->addr;
-
-        hwaddr dst_len = (hwaddr)size;
-        // gpa => hva
-        dst = cpu_physical_memory_map(arg->dst, &dst_len, 0);
-        if (!dst || dst_len != size) {
-            error("Failed to map MMIO memory for"
-                              " gpa 0x%lx element size %u\n",
-                                arg->dst, size);
-            return ;
-        }
-        //testOver4K(buf, size);
-        cuError( (err=cuMemcpyDtoHAsync((void *)dst, \
-                                (CUdeviceptr)src, size, cudaStream[tid][idx])) );
-        // err = 0;
+        if(!(dst=gpa_to_hva((hwaddr)arg->dst, size)))
+            return;
+        cuError( (err=cuMemcpyDtoHAsync((void *)dst, (CUdeviceptr)src, 
+                                        size, cudaStream[tid][idx])) );
     } else if (arg->flag == cudaMemcpyDeviceToDevice) {
         vol = find_vol_by_vaddr(arg->src, &cudaDevices[dev_id]);
         if(vol == NULL) {
@@ -762,8 +838,8 @@ static void cuda_memcpy_async(VirtIOArg *arg, int tid)
             return;
         }
         dst = (void*)vol->addr;
-        cuError( (err=cuMemcpyDtoDAsync((CUdeviceptr)dst, \
-                                (CUdeviceptr)src, size, cudaStream[tid][idx])) );
+        cuError( (err=cuMemcpyDtoDAsync((CUdeviceptr)dst, (CUdeviceptr)src, 
+                                        size, cudaStream[tid][idx])) );
     }
     arg->cmd = err;
     debug(" return value=%d\n", err);
@@ -781,8 +857,7 @@ static void cuda_memset(VirtIOArg *arg, int tid)
     count = (size_t)(arg->dstSize);
     value = (int)(arg->param);
     dst = (void *)(arg->dst);
-    debug("dst=0x%lx, value=%d, count=%lu\n", \
-        arg->dst, value, count);
+    debug("dst=0x%lx, value=%d, count=%lu\n", arg->dst, value, count);
     cuError( (err= cudaMemset(dst, value, count)));
     arg->cmd = err;
     debug(" return value=%d\n", err);
@@ -810,8 +885,8 @@ static void cuda_malloc(VirtIOArg *arg, int tid)
     list_add_tail(&vol->list, &cudaDevices[dev_id].vol);
     pthread_spin_unlock(&cudaDevices[dev_id].vol_lock);
     arg->cmd = err;
-    debug(" actual devPtr=0x%lx, virtual ptr=0x%lx, size=%d, return value=%d\n", 
-        (uint64_t)devPtr, arg->dst, size, err);
+    debug("actual devPtr=0x%lx, virtual ptr=0x%lx, size=0x%x,"
+          "ret value=0x%x\n", (uint64_t)devPtr, arg->dst, size, err);
 }
 
 static void cuda_free(VirtIOArg *arg, int tid)
@@ -860,7 +935,8 @@ static void cuda_get_device_properties(VirtIOArg *arg)
     devID = (int)(arg->flag);
     debug("Get prop for device %d\n", devID);
     cudaError( (err=cudaGetDeviceProperties(&prop, devID)) );
-    debug("Device %d : \"%s\" with compute %d.%d capability.\n", devID, prop.name, prop.major, prop.minor);
+    debug("Device %d : \"%s\" with compute %d.%d capability.\n", 
+          devID, prop.name, prop.major, prop.minor);
     arg->cmd = err;
     cpu_physical_memory_write(gpa, &prop, arg->dstSize);
 }
@@ -907,66 +983,91 @@ static void cuda_device_reset(VirtIOArg *arg, int tid)
 static void cuda_stream_create(VirtIOArg *arg, int tid)
 {
     cudaError_t err = 0;
-    uint32_t idx = cudaStreamNum[tid];
+    uint32_t pos = 0;
     func();
-
-    cudaError( (err = cudaStreamCreate(&cudaStream[tid][idx]) ));
-    arg->flag = (uint64_t)idx;
+    pos = ffs(cudaStreamBitmap[tid]);
+    if (!pos) {
+        error("stream number is up to %d\n", CudaStreamMaxNum);
+        return;
+    }
+    cudaError( (err = cudaStreamCreate(&cudaStream[tid][pos-1]) ));
+    arg->flag = (uint64_t)pos;
     debug("create stream %lu, idx is %u\n",
-        (uint64_t)cudaStream[tid][idx], idx);
-    cudaStreamNum[tid] = (cudaStreamNum[tid]+1)%CudaStreamMaxNum;
+          (uint64_t)cudaStream[tid][pos-1], pos-1);
+    __clear_bit(&cudaStreamBitmap[tid], pos-1);
     arg->cmd = err;
 }
 
 static void cuda_stream_destroy(VirtIOArg *arg, int tid)
 {
     cudaError_t err = 0;
-    uint32_t idx;
+    uint32_t pos;
     func();
-    idx = arg->flag;
-    cudaError( (err=cudaStreamDestroy(cudaStream[tid][idx]) ));
+    pos = arg->flag;
+    if (__get_bit(&cudaStreamBitmap[tid], pos-1)) {
+        error("No such stream, pos=%d\n", pos);
+        arg->cmd=cudaErrorInvalidResourceHandle;
+        return;
+    }
+    debug("destroy stream %lu\n", (uint64_t)cudaStream[tid][pos-1]);
+    cudaError( (err=cudaStreamDestroy(cudaStream[tid][pos-1]) ));
     arg->cmd = err;
-    memset(&cudaStream[tid][idx], 0, sizeof(cudaStream_t));
+    __set_bit(&cudaStreamBitmap[tid], pos-1);
 }
 
 static void cuda_event_create(VirtIOArg *arg, int tid)
 {
     cudaError_t err = 0;
-    uint32_t idx = cudaEventNum[tid];
+    uint32_t pos = 0;
     func();
-    cudaError( (err=cudaEventCreate(&cudaEvent[tid][idx]) ));
-    arg->flag = (uint64_t)idx;
+    pos = ffs(cudaEventBitmap[tid]);
+    if(!pos) {
+        error("event number is up to %d\n", CudaEventMaxNum);
+        return;
+    }
+    cudaError( (err=cudaEventCreate(&cudaEvent[tid][pos-1]) ));
+    arg->flag = (uint64_t)pos;
     arg->cmd = err;
-    cudaEventNum[tid] = (cudaEventNum[tid]+1)%CudaEventMaxNum;
+    __clear_bit(&cudaEventBitmap[tid], pos-1);
     debug("create event %lu, idx is %u\n",
-        (uint64_t)cudaEvent[tid][idx], idx);
+          (uint64_t)cudaEvent[tid][pos-1], pos-1);
 }
 
 static void cuda_event_create_with_flags(VirtIOArg *arg, int tid)
 {
     cudaError_t err = 0;
-    uint32_t idx = cudaEventNum[tid];
+    uint32_t pos = 0;
     unsigned int flag=0;
     func();
+    pos = ffs(cudaEventBitmap[tid]);
+    if(!pos) {
+        error("event number is up to %d\n", CudaEventMaxNum);
+        return;
+    }
     flag = arg->flag;
-    cudaError( (err=cudaEventCreateWithFlags(&cudaEvent[tid][idx], flag) ));
-    arg->dst = (uint64_t)idx;
+    cudaError( (err=cudaEventCreateWithFlags(&cudaEvent[tid][pos-1], flag) ));
+    arg->dst = (uint64_t)pos;
     arg->cmd = err;
-    cudaEventNum[tid] = (cudaEventNum[tid]+1)%CudaEventMaxNum;
+    __clear_bit(&cudaEventBitmap[tid], pos-1);
     debug("create event %lu with flag %u, idx is %u\n",
-        (uint64_t)cudaEvent[tid][idx], flag, idx);
+          (uint64_t)cudaEvent[tid][pos-1], flag, pos-1);
 }
 
 static void cuda_event_destroy(VirtIOArg *arg, int tid)
 {
     cudaError_t err = 0;
-    uint32_t idx = 0;
+    uint32_t pos = 0;
     func();
-    idx = arg->flag;
-    cudaError( (err=cudaEventDestroy(cudaEvent[tid][idx])) );
+    pos = arg->flag;
+    if (__get_bit(&cudaEventBitmap[tid], pos-1)) {
+        error("No such event, pos=%d\n", pos);
+        arg->cmd=cudaErrorInvalidValue;
+        return;
+    }
+    debug("destroy event %lu\n", (uint64_t)cudaEvent[tid][pos-1]);
+    cudaError( (err=cudaEventDestroy(cudaEvent[tid][pos-1])) );
     arg->cmd = err;
-    debug("destroy event %lu\n", (uint64_t)cudaEvent[tid][idx]);
-    memset(&cudaEvent[tid][idx], 0, sizeof(cudaEvent_t));
+    __set_bit(&cudaEventBitmap[tid], pos-1);
 }
 
 static void cuda_event_record(VirtIOArg *arg, int tid)
@@ -985,7 +1086,8 @@ static void cuda_event_record(VirtIOArg *arg, int tid)
     else
     {
 //      debug("record event %u, stream=%u\n", event, stream);
-        cudaError( (err=cudaEventRecord(cudaEvent[tid][idx], cudaStream[tid][sidx])) );
+        cudaError((err=cudaEventRecord(cudaEvent[tid][idx], 
+                                       cudaStream[tid][sidx])));
     }
     arg->cmd = err;
 }
@@ -1007,24 +1109,25 @@ static void cuda_event_elapsedtime(VirtIOArg *arg, int tid)
     uint64_t start_idx, stop_idx;
     float        time = 0;
     func();
-    // unsigned int id = get_current_id( (unsigned int)arg->tid );
     start_idx = arg->src;
     stop_idx = arg->dst;
     debug("start_idx = %lu , stop_idx = %lu\n", start_idx, stop_idx);
     cudaError( (err=cudaEventElapsedTime(&time, 
-                cudaEvent[tid][start_idx], 
-                cudaEvent[tid][stop_idx])) );
+                                         cudaEvent[tid][start_idx], 
+                                         cudaEvent[tid][stop_idx])) );
     arg->cmd = err;
     arg->flag = (uint64_t)time;
     // debug("event start %d to end %d, elapsedtime %f\n",
-    //(int)cudaEvent[start_idx], (int)cudaEvent[stop_idx], time);
 }
 
 static void cuda_thread_synchronize(VirtIOArg *arg)
 {
     cudaError_t err = 0;
     func();
-    // cudaError( (err=cudaThreadSynchronize()) );
+    /*
+    * cudaThreadSynchronize is deprecated
+    * cudaError( (err=cudaThreadSynchronize()) );
+    */
     cudaError( (err=cudaDeviceSynchronize()) );
     arg->cmd = err;
 }
@@ -1069,7 +1172,6 @@ static void cuda_gpa_to_hva(VirtIOArg *arg)
     int a;
     hwaddr gpa = (hwaddr)(arg->src);
     //a = gpa_to_hva(arg->src);
-
     cpu_physical_memory_read(gpa, &a, sizeof(int));
     debug("a=%d\n", a);
     a++;
@@ -1089,7 +1191,8 @@ static void *worker_processor(void *arg)
     int port_id = port->id;
     int device_id = work->device_id;
     int tid = port_id%total_port;
-    cudaError(cudaStreamCreate(&work->stream));
+    cudaError(cudaStreamCreate(&cudaStream[tid][0]));
+    debug("create stream 0x%lu\n", (uint64_t)cudaStream[tid][0]);
     cuError( cuCtxSetCurrent(cudaDevices[device_id].context) );
     debug("thread %d => device %d\n", tid, device_id);
     while(1) {
@@ -1127,7 +1230,7 @@ static void *worker_processor(void *arg)
             break;
         case VIRTIO_CUDA_CONFIGURECALL:
             message_queue_message_free(&worker_queue[tid], msg);
-            cudaError(cudaStreamDestroy(work->stream));
+            cudaError(cudaStreamDestroy(cudaStream[tid][0]));
             return NULL;
         case VIRTIO_CUDA_SETUPARGUMENT:
             cuda_setup_argument(msg);
@@ -1187,12 +1290,13 @@ static void *worker_processor(void *arg)
             cuda_mem_get_info(msg);
             break;
         default:
-            error("[+] header.cmd=%u, nr= %u \n", \
-                msg->cmd, _IOC_NR(msg->cmd));
+            error("[+] header.cmd=%u, nr= %u \n",
+                  msg->cmd, _IOC_NR(msg->cmd));
             return NULL;
         }
         message_queue_message_free(&worker_queue[tid], msg);
-        ret = virtio_serial_write(port, (const uint8_t *)msg, sizeof(VirtIOArg));
+        ret = virtio_serial_write(port, (const uint8_t *)msg, 
+                                  sizeof(VirtIOArg));
         if (ret < sizeof(VirtIOArg)) {
             error("write error.\n");
             virtio_serial_throttle_port(port, true);
@@ -1213,12 +1317,12 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
 {
     int tid;
     int i;
-    func();
 
     debug("port->id=%d, len=%ld\n", port->id, len);
     tid = port->id % total_port;
     for(i =0; i< len/sizeof(VirtIOArg); i++) {
-        VirtIOArg *mq_block = message_queue_message_alloc_blocking(&worker_queue[tid]);
+        VirtIOArg *mq_block = 
+                  message_queue_message_alloc_blocking(&worker_queue[tid]);
         memcpy((void *)mq_block, buf, sizeof(VirtIOArg));
         message_queue_write(&worker_queue[tid], mq_block);
     }
@@ -1259,7 +1363,7 @@ static void virtconsole_enable_backend(VirtIOSerialPort *port, bool enable)
         thread_id = port_id%total_port;
         debug("Ending thread %d computing workloads and queue!\n",thread_id);
         poison = message_queue_message_alloc_blocking(
-            &worker_queue[thread_id]);
+                 &worker_queue[thread_id]);
         poison->cmd = VIRTIO_CUDA_CONFIGURECALL;
         message_queue_write(&worker_queue[thread_id], poison);
         qemu_thread_join(&worker_threads[thread_id]);
@@ -1289,7 +1393,14 @@ static void spawn_thread_by_port(VirtIOSerialPort *port)
     message_queue_init(&worker_queue[thread_id], sizeof(VirtIOArg), 512);
     works[thread_id].device_id = (port_id-1)%total_device;
     works[thread_id].port = port;
+        /*reserved index 0 for thread*/
+    cudaStreamBitmap[thread_id] = 0xfffffffe;
+    cudaEventBitmap[thread_id] = 0xffffffff;
+    memset(cudaEvent[thread_id], 0, sizeof(cudaEvent_t)*CudaEventMaxNum);
+    memset(cudaStream[thread_id], 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
+
     sprintf(thread_name, "thread%d", thread_id);
+    /*start a stream for a thread, reserved cudaStream[tid][0]*/
     qemu_thread_create(&worker_threads[thread_id], thread_name, 
             worker_processor, &works[thread_id], QEMU_THREAD_JOINABLE);
     cudaFunctionNum[thread_id]=0;
