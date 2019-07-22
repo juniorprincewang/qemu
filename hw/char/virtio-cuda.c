@@ -119,16 +119,16 @@ typedef struct KernelConf {
 static int total_device;   // total GPU device
 static int total_port;     // port count
 static QemuMutex total_port_mutex;
-CudaDev *cudaDevices;
-CudaDev zeroedDevice;
-int cudaFunctionNum[WORKER_THREADS];
-CUdevice worker_cur_device[WORKER_THREADS];
-KernelInfo devicesKernels[WORKER_THREADS][CudaFunctionMaxNum];
+static CudaDev *cudaDevices;
+static CudaDev zeroedDevice;
+static int cudaFunctionNum[WORKER_THREADS];
+static CUdevice worker_cur_device[WORKER_THREADS];
+static KernelInfo devicesKernels[WORKER_THREADS][CudaFunctionMaxNum];
 
-cudaEvent_t cudaEvent[WORKER_THREADS][CudaEventMaxNum];
-word_t cudaEventBitmap[WORKER_THREADS];
-cudaStream_t cudaStream[WORKER_THREADS][CudaStreamMaxNum];
-word_t cudaStreamBitmap[WORKER_THREADS];
+static cudaEvent_t cudaEvent[WORKER_THREADS][CudaEventMaxNum];
+static word_t cudaEventBitmap[WORKER_THREADS];
+static cudaStream_t cudaStream[WORKER_THREADS][CudaStreamMaxNum];
+static word_t cudaStreamBitmap[WORKER_THREADS];
 
 
 static int global_initialized = 0;
@@ -293,13 +293,6 @@ static int get_active_ports_nr(VirtIOSerial *vser)
     return nr_active_ports;
 }
 
-typedef struct Workload
-{
-    int device_id;
-    VirtIOSerialPort *port;
-} Workload;
-
-Workload works[WORKER_THREADS];
 static struct message_queue worker_queue[WORKER_THREADS];
 static QemuThread worker_threads[WORKER_THREADS];
 
@@ -408,8 +401,8 @@ static void deinit_device(VirtIOSerial *vser)
     global_deinitialized=0;
     qemu_mutex_unlock(&vser->deinit_mutex);
     func();
-    qemu_mutex_destroy(&total_port_mutex);
 
+    qemu_mutex_destroy(&total_port_mutex);
     debug("free cudaDevices stuff\n");
     i = total_device;
     while(i-- != 0) {
@@ -472,6 +465,10 @@ static void cuda_unregister_fatinary(VirtIOArg *arg, int tid)
         memset(&devicesKernels[tid][f_idx], 0, 
             sizeof(devicesKernels[tid][f_idx]));
     }
+    if(cudaStream[tid][0]) {
+        debug("Using stream 0 0x%lx sync\n", (uint64_t)cudaStream[tid][0]);
+        cudaError(cudaStreamSynchronize(cudaStream[tid][0]));
+    }
     cudaFunctionNum[tid] = 0;
 }
 
@@ -528,6 +525,14 @@ static void cuda_setup_argument(VirtIOArg *arg)
     func();
 }
 
+static cudaStream_t get_stream_zero(int tid)
+{
+    if(!cudaStream[tid][0]) {
+        cudaError(cudaStreamCreate(&cudaStream[tid][0]));
+    }
+    return cudaStream[tid][0];
+}
+
 static void cuda_launch(VirtIOArg *arg, int tid)
 {
     cudaError_t err;
@@ -537,7 +542,7 @@ static void cuda_launch(VirtIOArg *arg, int tid)
     void **para_buf=NULL;
     uint32_t para_size, conf_size;
     VOL *vol=NULL;
-    cudaStream_t stream;
+    cudaStream_t stream_kernel;
     // hwaddr gpa_para = (hwaddr)(arg->src);
     // hwaddr gpa_conf = (hwaddr)(arg->dst);
     func();
@@ -590,17 +595,18 @@ static void cuda_launch(VirtIOArg *arg, int tid)
         return;
     }
     debug("Found func_idx = %d.\n", func_idx);
-    debug("Found function  = %lu.\n", 
+    debug("Found function  = 0x%lx.\n", 
           (uint64_t)devicesKernels[tid][func_idx].func_id);
     debug("gridDim=%u %u %u\n", conf->gridDim.x, 
           conf->gridDim.y, conf->gridDim.z);
     debug("blockDim=%u %u %u\n", conf->blockDim.x,
           conf->blockDim.y, conf->blockDim.z);
     debug("sharedMem=%ld\n", conf->sharedMem);
-    debug("stream=%lu\n", (uint64_t)(conf->stream));
-
-    if(!((uint64_t)conf->stream))
-        stream = cudaStream[tid][0];
+    debug("stream=0x%lx\n", (uint64_t)(conf->stream));
+    
+    if(!((uint64_t)conf->stream)) {
+        stream_kernel = get_stream_zero(tid);
+    }
     else {
         int pos=(uint64_t)conf->stream;
         if (__get_bit(&cudaStreamBitmap[tid], pos-1)) {
@@ -608,17 +614,16 @@ static void cuda_launch(VirtIOArg *arg, int tid)
             arg->cmd=cudaErrorLaunchFailure;
             return;
         }
-        stream = cudaStream[tid][pos-1];
+        stream_kernel = cudaStream[tid][pos-1];
     }
-    debug("now stream=%lu\n", (uint64_t)(stream));
+    debug("now stream=0x%lx\n", (uint64_t)(stream_kernel));
     cuError( (err = cuLaunchKernel(devicesKernels[tid][func_idx].kernel_func,
                     conf->gridDim.x, conf->gridDim.y, conf->gridDim.z,
                     conf->blockDim.x, conf->blockDim.y, conf->blockDim.z,
-                    conf->sharedMem, stream, para_buf, NULL) ) );
-    // cudaError(err=cudaLaunchKernel(devicesKernels[tid][func_idx].kernel_func,
-    //                                conf->gridDim, conf->blockDim, para_buf,
-    //                                conf->sharedMem, 
-    //                                stream));
+                    conf->sharedMem,
+                    stream_kernel,
+                    para_buf,
+                    NULL) ) );
     arg->cmd = err;
     free(para_buf);
     para_buf = NULL;
@@ -697,8 +702,10 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
         }
         dst = (void *)vol->addr;
         /* use stream to asynchronize transferring data*/
+        cudaStream_t stream_thread = get_stream_zero(tid);
+        debug("Using stream 0 0x%lx HtoD\n", (uint64_t)stream_thread);
         cuError( (err= cuMemcpyHtoDAsync((CUdeviceptr)dst, src, 
-                                         size, cudaStream[tid][0])));
+                                         size, stream_thread)));
         MemoryPool_Free(mpool, src);
     } else if (arg->flag == cudaMemcpyDeviceToHost) {
         // get host address
@@ -714,8 +721,10 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
             return;
         }
         src = (void*)vol->addr;
+        cudaStream_t stream_thread = get_stream_zero(tid);
+        debug("Using stream 0 0x%lx DtoH\n", (uint64_t)stream_thread);
         cuError( (err=cuMemcpyDtoHAsync(dst, (CUdeviceptr)src, 
-                                        size, cudaStream[tid][0])) );
+                                        size, stream_thread)) );
         // copy back to VM
         if(arg->param) {
             int blocks = arg->param;
@@ -765,8 +774,10 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
             return;
         }
         dst = (void*)vol->addr;
+        cudaStream_t stream_thread = get_stream_zero(tid);
+        debug("Using stream 0 0x%lx DtoD\n", (uint64_t)stream_thread);
         cuError( (err=cuMemcpyDtoDAsync((CUdeviceptr)dst, (CUdeviceptr)src,
-                                        size, cudaStream[tid][0])) );
+                                        size, stream_thread)) );
     }
     arg->cmd = err;
     debug(" return value=%d\n", err);
@@ -783,8 +794,8 @@ static void cuda_memcpy_async(VirtIOArg *arg, int tid)
     func();
     // in case cudaDeviceReset was the previous call
     initialize_device(tid);
-    debug("src=0x%lx, srcSize=%d, dst=9x%lx, dstSize=%d, kind=%lu, "
-        "stream idx = %lu \n",
+    debug("src=0x%lx, srcSize=0x%x, dst=0x%lx, dstSize=0x%x, kind=%lu, "
+        "stream idx = 0x%lx \n",
         arg->src, arg->srcSize, arg->dst, arg->dstSize, arg->flag, arg->param);
     size = arg->srcSize;
     if (arg->flag == cudaMemcpyHostToDevice) {
@@ -850,17 +861,26 @@ static void cuda_memset(VirtIOArg *arg, int tid)
     cudaError_t err;
     size_t count;
     int value;
-    void *dst;
+    uint64_t dst;
+    VOL *vol, *vol2;
+    int dev_id = worker_cur_device[tid];
     func();
     // in case cudaDeviceReset was the previous call
     initialize_device(tid);
     count = (size_t)(arg->dstSize);
     value = (int)(arg->param);
-    dst = (void *)(arg->dst);
-    debug("dst=0x%lx, value=%d, count=%lu\n", arg->dst, value, count);
-    cuError( (err= cudaMemset(dst, value, count)));
-    arg->cmd = err;
-    debug(" return value=%d\n", err);
+    dst = (uint64_t)arg->dst;
+    debug("dst=0x%lx, value=0x%x, count=0x%lx\n", dst, value, count);
+    list_for_each_entry_safe(vol, vol2, &cudaDevices[dev_id].vol, list) {
+        if (vol->v_addr == dst) {
+            cuError( (err= cudaMemset((void*)(vol->addr), value, count)));
+            arg->cmd = err;
+            debug(" return value=%d\n", err);
+            return;
+        }
+    }
+    arg->cmd = cudaErrorInvalidValue;
+    error("Failed! cudaErrorInvalidValue\n");
 }
 
 static void cuda_malloc(VirtIOArg *arg, int tid)
@@ -914,6 +934,9 @@ static void cuda_free(VirtIOArg *arg, int tid)
     error("Failed to find ptr!\n");
 }
 
+/*
+ * done by the vgpu in vm
+*/
 static void cuda_get_device(VirtIOArg *arg, int tid)
 {
     int dev = 0;
@@ -925,6 +948,9 @@ static void cuda_get_device(VirtIOArg *arg, int tid)
     cpu_physical_memory_write(gpa, &dev, sizeof(int));
 }
 
+/*
+ * done by the vgpu in vm
+*/
 static void cuda_get_device_properties(VirtIOArg *arg)
 {
     cudaError_t err;
@@ -974,9 +1000,43 @@ static void cuda_get_device_count(VirtIOArg *arg)
 static void cuda_device_reset(VirtIOArg *arg, int tid)
 {
     func();
-    // should get rid of events for current devices
-    cuCtxDestroy(cudaDevices[worker_cur_device[tid]].context ) ;
-    memset( &cudaDevices[worker_cur_device[tid]], 0, sizeof(CudaDev) );
+    /* TO DO
+    * should not use
+    * cuCtxDestroy(cudaDevices[worker_cur_device[tid]].context ) ;
+    * reinit all global variables
+    */
+
+    // free memory
+    int dev_id = worker_cur_device[tid];
+    VOL *vol, *vol2;
+    list_for_each_entry_safe(vol, vol2, &cudaDevices[dev_id].vol, list) {
+        cudaError( cudaFree((void*)(vol->addr))) ;
+        pthread_spin_lock(&cudaDevices[dev_id].vol_lock);
+        list_del(&vol->list);
+        pthread_spin_unlock(&cudaDevices[dev_id].vol_lock);
+    }
+    // free stream
+    if(cudaStream[tid][0]) {
+        cudaError( cudaStreamDestroy(cudaStream[tid][0]) );
+        debug("after destroy stream 0x%lx\n", (uint64_t)cudaStream[tid][0]);
+    }
+    for(int pos = 2; pos <= BITS_PER_WORD; pos++) {
+        if(!__get_bit(&cudaStreamBitmap[tid], pos-1)) {
+            cudaError( cudaStreamDestroy(cudaStream[tid][pos-1]) );
+        }
+    }
+    cudaStreamBitmap[tid] = 0xfffffffe;
+    memset(cudaStream[tid], 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
+
+    // free event
+    for(int pos = 1; pos <= BITS_PER_WORD; pos++) {
+        if(!__get_bit(&cudaEventBitmap[tid], pos-1)) {
+            cudaError( cudaEventDestroy(cudaEvent[tid][pos-1]) );
+        }
+    }
+    cudaEventBitmap[tid] = 0xffffffff;
+    memset(cudaEvent[tid], 0, sizeof(cudaEvent_t)*CudaEventMaxNum);
+    arg->cmd = (int32_t)cudaSuccess;
     debug("reset devices\n");
 }
 
@@ -992,7 +1052,7 @@ static void cuda_stream_create(VirtIOArg *arg, int tid)
     }
     cudaError( (err = cudaStreamCreate(&cudaStream[tid][pos-1]) ));
     arg->flag = (uint64_t)pos;
-    debug("create stream %lu, idx is %u\n",
+    debug("create stream 0x%lx, idx is %u\n",
           (uint64_t)cudaStream[tid][pos-1], pos-1);
     __clear_bit(&cudaStreamBitmap[tid], pos-1);
     arg->cmd = err;
@@ -1009,7 +1069,7 @@ static void cuda_stream_destroy(VirtIOArg *arg, int tid)
         arg->cmd=cudaErrorInvalidResourceHandle;
         return;
     }
-    debug("destroy stream %lu\n", (uint64_t)cudaStream[tid][pos-1]);
+    debug("destroy stream 0x%lx\n", (uint64_t)cudaStream[tid][pos-1]);
     cudaError( (err=cudaStreamDestroy(cudaStream[tid][pos-1]) ));
     arg->cmd = err;
     __set_bit(&cudaStreamBitmap[tid], pos-1);
@@ -1029,7 +1089,7 @@ static void cuda_event_create(VirtIOArg *arg, int tid)
     arg->flag = (uint64_t)pos;
     arg->cmd = err;
     __clear_bit(&cudaEventBitmap[tid], pos-1);
-    debug("create event %lu, idx is %u\n",
+    debug("create event 0x%lx, idx is %u\n",
           (uint64_t)cudaEvent[tid][pos-1], pos-1);
 }
 
@@ -1049,7 +1109,7 @@ static void cuda_event_create_with_flags(VirtIOArg *arg, int tid)
     arg->dst = (uint64_t)pos;
     arg->cmd = err;
     __clear_bit(&cudaEventBitmap[tid], pos-1);
-    debug("create event %lu with flag %u, idx is %u\n",
+    debug("create event 0x%lx with flag %u, idx is %u\n",
           (uint64_t)cudaEvent[tid][pos-1], flag, pos-1);
 }
 
@@ -1064,7 +1124,7 @@ static void cuda_event_destroy(VirtIOArg *arg, int tid)
         arg->cmd=cudaErrorInvalidValue;
         return;
     }
-    debug("destroy event %lu\n", (uint64_t)cudaEvent[tid][pos-1]);
+    debug("destroy event 0x%lx\n", (uint64_t)cudaEvent[tid][pos-1]);
     cudaError( (err=cudaEventDestroy(cudaEvent[tid][pos-1])) );
     arg->cmd = err;
     __set_bit(&cudaEventBitmap[tid], pos-1);
@@ -1186,13 +1246,13 @@ static void *worker_processor(void *arg)
 {
     VirtIOArg *msg;
     int ret=0;
-    Workload *work = (Workload*)arg;
-    VirtIOSerialPort *port = work->port;
+    VirtIOSerialPort *port = (VirtIOSerialPort*)arg;
     int port_id = port->id;
-    int device_id = work->device_id;
     int tid = port_id%total_port;
-    cudaError(cudaStreamCreate(&cudaStream[tid][0]));
-    debug("create stream 0x%lu\n", (uint64_t)cudaStream[tid][0]);
+    int device_id = worker_cur_device[tid];
+    /*start a stream for a thread, reserved cudaStream[tid][0]*/
+    // cudaError(cudaStreamCreate(&cudaStream[tid][0]));
+    debug("create stream 0x%lx\n", (uint64_t)cudaStream[tid][0]);
     cuError( cuCtxSetCurrent(cudaDevices[device_id].context) );
     debug("thread %d => device %d\n", tid, device_id);
     while(1) {
@@ -1230,7 +1290,6 @@ static void *worker_processor(void *arg)
             break;
         case VIRTIO_CUDA_CONFIGURECALL:
             message_queue_message_free(&worker_queue[tid], msg);
-            cudaError(cudaStreamDestroy(cudaStream[tid][0]));
             return NULL;
         case VIRTIO_CUDA_SETUPARGUMENT:
             cuda_setup_argument(msg);
@@ -1368,7 +1427,10 @@ static void virtconsole_enable_backend(VirtIOSerialPort *port, bool enable)
         message_queue_write(&worker_queue[thread_id], poison);
         qemu_thread_join(&worker_threads[thread_id]);
         message_queue_destroy(&worker_queue[thread_id]);
-        
+        if(cudaStream[thread_id][0]) {
+            debug("Using stream 0 0x%lx destroy\n", (uint64_t)cudaStream[thread_id][0]);
+            cudaError(cudaStreamDestroy(cudaStream[thread_id][0]));
+        }
         return;
     }
     if(enable && !global_deinitialized)
@@ -1391,8 +1453,7 @@ static void spawn_thread_by_port(VirtIOSerialPort *port)
     debug("Starting thread %d computing workloads and queue!\n",thread_id);
     // initialize message queue for worker_threads[thread_id]
     message_queue_init(&worker_queue[thread_id], sizeof(VirtIOArg), 512);
-    works[thread_id].device_id = (port_id-1)%total_device;
-    works[thread_id].port = port;
+    worker_cur_device[thread_id] = (port_id-1)%total_device;
         /*reserved index 0 for thread*/
     cudaStreamBitmap[thread_id] = 0xfffffffe;
     cudaEventBitmap[thread_id] = 0xffffffff;
@@ -1400,9 +1461,8 @@ static void spawn_thread_by_port(VirtIOSerialPort *port)
     memset(cudaStream[thread_id], 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
 
     sprintf(thread_name, "thread%d", thread_id);
-    /*start a stream for a thread, reserved cudaStream[tid][0]*/
     qemu_thread_create(&worker_threads[thread_id], thread_name, 
-            worker_processor, &works[thread_id], QEMU_THREAD_JOINABLE);
+            worker_processor, port, QEMU_THREAD_JOINABLE);
     cudaFunctionNum[thread_id]=0;
 }
 
