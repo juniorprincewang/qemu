@@ -807,13 +807,14 @@ static Property virtio_cuda_properties[] = {
     DEFINE_PROP_END_OF_LIST(),
 };
 
+
 static void virtio_cuda_device_realize(DeviceState *dev, Error **errp)
 {
     VirtIODevice *vdev = VIRTIO_DEVICE(dev);
     VirtIOSerial *vser = VIRTIO_CUDA(dev);
     uint32_t i, max_supported_ports;
     size_t config_size = sizeof(struct virtio_console_config);
-    int gcount=0;
+
     cudaError_t err;
     func();
 
@@ -852,25 +853,93 @@ static void virtio_cuda_device_realize(DeviceState *dev, Error **errp)
 
     qemu_mutex_init(&vser->init_mutex);
     qemu_mutex_init(&vser->deinit_mutex);
-    err=cudaGetDeviceCount(&gcount);
-    if (err != cudaSuccess) {
-        error_setg(errp, "CUDA Runtime API Error = %s", 
-                        (char*)cudaGetErrorString(err));
-        return;
-    }
-    vser->gcount=gcount;
-    vser->gpus = g_malloc(gcount*sizeof(struct GPUDevice *));
-    for (i = 0; i < gcount; i++) {
-        vser->gpus[i] = (struct GPUDevice *)g_malloc(sizeof(struct GPUDevice));
-        cudaSetDevice(i);
-        vser->gpus[i]->device_id = i;
-        err = cudaGetDeviceProperties(&vser->gpus[i]->prop, i);
-        if (err != cudaSuccess) {
-            error_setg(errp, "CUDA Runtime API Error = %s", 
-                            (char*)cudaGetErrorString(err));
-            return;
+    
+    int gcount = 0;
+    int  pfd[2], cfd[2];
+    pipe(pfd);
+    pipe(cfd);
+    pid_t cpid = fork();
+    if(cpid == 0) {
+        printf("child pid=%d\n", getpid());
+        printf("child's parent ppid=%d\n", getppid());
+        close(pfd[1]);
+        close(cfd[0]);
+        int cmd;
+        while (1) {
+            while(read(pfd[0], &cmd, 4) == 0);
+            if(cmd==0)
+                break;
+            switch(cmd) {
+                case 1: {
+                    int num;
+                    err=cudaGetDeviceCount(&num);
+                    if (err != cudaSuccess) {
+                        error_setg(errp, "CUDA Runtime API Error = %s", 
+                                        (char*)cudaGetErrorString(err));
+                        break;
+                    }
+                    write(cfd[1], &num, 4);
+                    break;
+                }
+                case 2: {
+                    int dev=0;
+                    read(pfd[0], &dev, 4);
+                    err = cudaSetDevice(dev);
+                    if (err != cudaSuccess) {
+                        error_setg(errp, "CUDA Runtime API Error = %s", 
+                                        (char*)cudaGetErrorString(err));
+                        break;
+                    }
+                    break;
+                }
+                case 3: {
+                    struct cudaDeviceProp prop;
+                    int dev=0;
+                    read(pfd[0], &dev, 4);
+                    err = cudaGetDeviceProperties(&prop, dev);
+                    if (err != cudaSuccess) {
+                        error_setg(errp, "CUDA Runtime API Error = %s", 
+                                        (char*)cudaGetErrorString(err));
+                        break;
+                    }
+                    write(cfd[1], &prop, sizeof(struct cudaDeviceProp));
+                    break;
+                }
+                default:
+                    printf("No such cmd %d\n", cmd);
+            }
         }
+        printf("child process finish\n");
+        exit(EXIT_SUCCESS);
     }
+    close(pfd[0]);
+    close(cfd[1]);
+    int cmd =1;
+    write(pfd[1], &cmd, 4);
+    while(read(cfd[0], &gcount, sizeof(4))==0);
+    printf("gcount=%d\n", gcount);
+    vser->gcount = gcount;
+    // cmd = 0;
+    // write(pfd[1], &cmd, 4);
+
+    vser->gpus = g_malloc(vser->gcount*sizeof(struct GPUDevice *));
+    for (i = 0; i < vser->gcount; i++) {
+        vser->gpus[i] = (struct GPUDevice *)g_malloc(sizeof(struct GPUDevice));
+        // cudaSetDevice(i);
+        cmd = 2;
+        write(pfd[1], &cmd, 4);
+        write(pfd[1], &i, 4);
+        vser->gpus[i]->device_id = i;
+        // cudaGetDeviceProperties(&prop, i)
+        cmd = 3;
+        write(pfd[1], &cmd, 4);
+        write(pfd[1], &i, 4);
+        while(read(cfd[0], &vser->gpus[i]->prop, sizeof(struct cudaDeviceProp))==0);
+        printf("\nDevice %d: \"%s\"\n", i, vser->gpus[i]->prop.name);
+    }
+    // kill child process
+    cmd = 0;
+    write(pfd[1], &cmd, 4);
     /* Add a queue for host to guest transfers for port 0 (backward compat) */
     vser->ivqs[0] = virtio_add_queue(vdev, 128, handle_input);
     /* Add a queue for guest to host transfers for port 0 (backward compat) */

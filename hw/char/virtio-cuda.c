@@ -341,18 +341,6 @@ static int __get_bit(word_t *word, int n)
     return bit != 0;
 }
 
-
-/*
-static void *memdup(const void *src, size_t n)
-{
-    void *dst;
-    dst = malloc(n);
-    if(dst == NULL)
-        return NULL;
-    return memcpy(dst, src, n);
-}
-*/
-
 static void init_device(VirtIOSerial *vser)
 {
     unsigned int i;
