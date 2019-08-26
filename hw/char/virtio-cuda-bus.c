@@ -251,14 +251,14 @@ static void handle_control_message(VirtIOSerial *vser, void *buf, size_t len)
     }
 
     if (cpkt.event == VIRTIO_CONSOLE_VGPU) {
-        printf("VIRTIO_CONSOLE_VGPU\n");
+        // printf("VIRTIO_CONSOLE_VGPU\n");
         virtio_stw_p(vdev, &cpkt.event, VIRTIO_CONSOLE_VGPU);
         virtio_stw_p(vdev, &cpkt.value, 1);
         size = vser->gcount;
-        buffer_len = sizeof(cpkt)+sizeof(int)+size*sizeof(struct GPUDevice);
+        buffer_len = sizeof(cpkt)+sizeof(uint32_t)+size*sizeof(struct GPUDevice);
         buffer = g_malloc(buffer_len);
         memcpy(buffer, &cpkt, sizeof(cpkt));
-        memcpy(buffer + sizeof(cpkt), &size, sizeof(size));
+        memcpy(buffer + sizeof(cpkt), &size, sizeof(uint32_t));
         tmp = buffer + sizeof(cpkt) + sizeof(uint32_t);
         for(i=0; i<size; i++) {
             memcpy(tmp, vser->gpus[i], sizeof(struct GPUDevice));
@@ -861,7 +861,7 @@ static void virtio_cuda_device_realize(DeviceState *dev, Error **errp)
     pid_t cpid = fork();
     if(cpid == 0) {
         printf("child pid=%d\n", getpid());
-        printf("child's parent ppid=%d\n", getppid());
+        // printf("child's parent ppid=%d\n", getppid());
         close(pfd[1]);
         close(cfd[0]);
         int cmd;
@@ -917,7 +917,7 @@ static void virtio_cuda_device_realize(DeviceState *dev, Error **errp)
     int cmd =1;
     write(pfd[1], &cmd, 4);
     while(read(cfd[0], &gcount, sizeof(4))==0);
-    printf("gcount=%d\n", gcount);
+    // printf("gcount=%d\n", gcount);
     vser->gcount = gcount;
     // cmd = 0;
     // write(pfd[1], &cmd, 4);
@@ -935,11 +935,14 @@ static void virtio_cuda_device_realize(DeviceState *dev, Error **errp)
         write(pfd[1], &cmd, 4);
         write(pfd[1], &i, 4);
         while(read(cfd[0], &vser->gpus[i]->prop, sizeof(struct cudaDeviceProp))==0);
-        printf("\nDevice %d: \"%s\"\n", i, vser->gpus[i]->prop.name);
+        // printf("\nDevice %d: \"%s\"\n", i, vser->gpus[i]->prop.name);
+        // printf( "  CUDA Capability Major/Minor version number:    %d.%d\n", 
+                // vser->gpus[i]->prop.major, vser->gpus[i]->prop.minor);
     }
     // kill child process
     cmd = 0;
     write(pfd[1], &cmd, 4);
+    wait(NULL);
     /* Add a queue for host to guest transfers for port 0 (backward compat) */
     vser->ivqs[0] = virtio_add_queue(vdev, 128, handle_input);
     /* Add a queue for guest to host transfers for port 0 (backward compat) */

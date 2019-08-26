@@ -66,7 +66,7 @@
     OBJECT_CHECK(VirtConsole, (obj), TYPE_VIRTIO_CONSOLE_SERIAL_PORT)
 
 #ifndef WORKER_THREADS
-#define WORKER_THREADS 32
+#define WORKER_THREADS 32+1
 #endif
 
 /* bitmap */
@@ -150,7 +150,7 @@ static int global_deinitialized = 0;
         write(pipes, &err, sizeof(cudaError_t)); \
         break;\
     } \
-    printf("sending err %d\n", err);\
+    debug("sending err %d\n", err);\
     write(pipes, &err, sizeof(cudaError_t)); \
 }
 
@@ -164,7 +164,7 @@ static int global_deinitialized = 0;
         write(pipes, &err, sizeof(cudaError_t)); \
         break;\
     } \
-    printf("sending err %d\n", err);\
+    debug("sending err %d\n", err);\
     write(pipes, &err, sizeof(cudaError_t)); \
 }
 
@@ -348,11 +348,6 @@ static cudaError_t initialize_device(unsigned int tid)
         debug("Cuda device %d\n", cudaDevices[dev].device);
     }
     return cudaSuccess;
-}
-
-static unsigned int get_current_id(unsigned int tid)
-{
-    return tid%total_device;
 }
 
 /*
@@ -865,12 +860,12 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
             return;
         }
         read(cfd[tid][READ], dst, size);
-
         // copy back to VM
         if(arg->param) {
             int blocks = arg->param;
             gpa_array = (uint64_t*)gpa_to_hva((hwaddr)arg->dst, blocks);
             if(!gpa_array) {
+                error("Failed to get gpa_array.\n");
                 arg->cmd = cudaErrorInvalidValue;
                 return;
             }
@@ -1141,7 +1136,6 @@ static void cuda_free(VirtIOArg *arg, int tid)
         if (vol->v_addr == src) {
             debug(  "actual devPtr=0x%lx, virtual ptr=0x%lx\n", 
                     (uint64_t)vol->addr, src);
-            // communicate with pipe
             int cmd = VIRTIO_CUDA_FREE;
             write(pfd[tid][WRITE], &cmd, 4);
             // cudaError( (err= cudaFree((void*)(vol->addr))) );
@@ -1196,6 +1190,7 @@ static void cuda_get_device_properties(VirtIOArg *arg)
 
 static void cuda_set_device(VirtIOArg *arg, int tid)
 {
+    cudaError_t err = -1;
     func();
     int dev_id = (int)(arg->flag);
     if (dev_id < 0 || dev_id > total_device-1) {
@@ -1204,8 +1199,15 @@ static void cuda_set_device(VirtIOArg *arg, int tid)
         return ;
     }
     worker_cur_device[tid] = dev_id;
-    initialize_device(tid);
-    arg->cmd = cudaSuccess;
+    int cmd = VIRTIO_CUDA_SETDEVICE;
+    write(pfd[tid][WRITE], &cmd, 4);
+    write(pfd[tid][WRITE], &dev_id, 4);
+    while(read(cfd[tid][READ], &err, sizeof(cudaError_t))==0);
+    arg->cmd = err;
+    if (err != cudaSuccess) {
+        error("free error.\n");
+        return;
+    }
     debug("set devices=%d\n", (int)(arg->flag));
 }
 
@@ -1216,9 +1218,7 @@ static void cuda_set_device_flags(VirtIOArg *arg)
 
 static void cuda_get_device_count(VirtIOArg *arg)
 {
-    unsigned int id = get_current_id( (unsigned int)arg->tid );
     func();
-    initialize_device(id);
     debug("Device count=%d.\n", total_device);
     arg->cmd = (int32_t)cudaSuccess;
     arg->flag = (uint64_t)total_device;
@@ -1436,24 +1436,24 @@ static void cuda_event_elapsedtime(VirtIOArg *arg, int tid)
     arg->flag = (uint64_t)time;
 }
 
-static void cuda_thread_synchronize(VirtIOArg *arg)
+static void cuda_device_synchronize(VirtIOArg *arg, int tid)
 {
-    cudaError_t err = 0;
+    cudaError_t err = -1;
+    func();
+    int cmd =VIRTIO_CUDA_DEVICESYNCHRONIZE;
+    write(pfd[tid][WRITE], &cmd, 4);
+    while(read(cfd[tid][READ], &err, sizeof(cudaError_t))==0);
+    arg->cmd = err;
+}
+
+static void cuda_thread_synchronize(VirtIOArg *arg, int tid)
+{
     func();
     /*
     * cudaThreadSynchronize is deprecated
     * cudaError( (err=cudaThreadSynchronize()) );
     */
-    cudaError( (err=cudaDeviceSynchronize()) );
-    arg->cmd = err;
-}
-
-static void cuda_device_synchronize(VirtIOArg *arg)
-{
-    cudaError_t err = 0;
-    func();
-    cudaError( (err=cudaDeviceSynchronize()) );
-    arg->cmd = err;
+    cuda_device_synchronize(arg, tid);
 }
 
 static void cuda_get_last_error(VirtIOArg *arg, int tid)
@@ -1467,13 +1467,21 @@ static void cuda_get_last_error(VirtIOArg *arg, int tid)
     arg->cmd = err;
 }
 
-static void cuda_mem_get_info(VirtIOArg *arg)
+static void cuda_mem_get_info(VirtIOArg *arg, int tid)
 {
-    cudaError_t err = 0;
+    cudaError_t err = -1;
     size_t freeMem, totalMem;
     func();
-    cudaError( (err=cudaMemGetInfo(&freeMem, &totalMem)) );
+    int cmd =VIRTIO_CUDA_MEMGETINFO;
+    write(pfd[tid][WRITE], &cmd, 4);
+    while(read(cfd[tid][READ], &err, sizeof(cudaError_t))==0);
     arg->cmd = err;
+    if (err != cudaSuccess) {
+        error("get mem info error!\n");
+        return;
+    }
+    read(cfd[tid][READ], &freeMem, sizeof(size_t));
+    read(cfd[tid][READ], &totalMem, sizeof(size_t));
     arg->srcSize = freeMem;
     arg->dstSize = totalMem;
     debug("free memory = %lu, total memory = %lu.\n", freeMem, totalMem);
@@ -1511,7 +1519,7 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
     int ret;
 
     debug("port->id=%d, len=%ld\n", port->id, len);
-    tid = port->id % total_port;
+    tid = port->id;// % total_port;
     if (len != sizeof(VirtIOArg)) {
         error("buf len should be %lu, not %ld\n", sizeof(VirtIOArg), len);
         return 0;
@@ -1596,7 +1604,7 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
         cuda_event_elapsedtime(msg, tid);
         break;
     case VIRTIO_CUDA_THREADSYNCHRONIZE:
-        cuda_thread_synchronize(msg);
+        cuda_thread_synchronize(msg, tid);
         break;
     case VIRTIO_CUDA_GETLASTERROR:
         cuda_get_last_error(msg, tid);
@@ -1608,10 +1616,10 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
         cuda_memset(msg, tid);
         break;
     case VIRTIO_CUDA_DEVICESYNCHRONIZE:
-        cuda_device_synchronize(msg);
+        cuda_device_synchronize(msg, tid);
         break;
     case VIRTIO_CUDA_MEMGETINFO:
-        cuda_mem_get_info(msg);
+        cuda_mem_get_info(msg, tid);
         break;
     default:
         error("[+] header.cmd=%u, nr= %u \n",
@@ -1658,7 +1666,7 @@ static void virtconsole_enable_backend(VirtIOSerialPort *port, bool enable)
     if(!enable && global_deinitialized) {
         if (!total_port)
             return;
-        thread_id = port_id%total_port;
+        thread_id = port_id; //%total_port;
         debug("Ending subprocess %d !\n",thread_id);
         /*
         * kill tid child process
@@ -1683,7 +1691,7 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
 {
     pid_t cpid =0;
     int port_id = port->id;
-    int tid = port_id%total_port;
+    int tid = port_id; //%total_port;
     debug("Starting subprocess %d !\n", tid);
 
     // initialize message pipe
@@ -1702,7 +1710,7 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
     cpid = fork();
     if(cpid == 0) {
         printf("child pid=%d\n", getpid());
-        printf("child's parent ppid=%d\n", getppid());
+        debug("child's parent ppid=%d\n", getppid());
         close(pfd[tid][WRITE]);
         close(cfd[tid][READ]);
         int cmd;
@@ -1815,7 +1823,7 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                         dst = malloc(data_len);
                         read(pfd[tid][READ], &src, sizeof(void *));
                         cuCheck(cuMemcpyDtoH(dst, (CUdeviceptr)src, data_len), cfd[tid][WRITE]);
-                        debug("float point [0] = %f\n", *(float*)dst);
+                        // debug("float point [0] = %f\n", *(float*)dst);
                         write(cfd[tid][WRITE], dst, data_len);
                         free(dst);
                     } else if (direction == cudaMemcpyDeviceToDevice) {
@@ -1857,7 +1865,24 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                                             para_buf,
                                             NULL) , cfd[tid][WRITE]);
                     free(para);
-
+                    free(para_buf);
+                    break;
+                }
+                case VIRTIO_CUDA_SETDEVICE: {
+                    int dev = 0;
+                    read(pfd[tid][READ], &dev, 4);
+                    cudaCheck(cudaSetDevice(dev), cfd[tid][WRITE]);
+                    break;
+                }
+                case VIRTIO_CUDA_MEMGETINFO: {
+                    size_t freeMem, totalMem;
+                    cudaCheck(cudaMemGetInfo(&freeMem, &totalMem), cfd[tid][WRITE]);
+                    write(cfd[tid][WRITE], &freeMem, sizeof(size_t));
+                    write(cfd[tid][WRITE], &totalMem, sizeof(size_t));
+                    break;
+                }
+                case VIRTIO_CUDA_DEVICESYNCHRONIZE : {
+                    cudaCheck(cudaDeviceSynchronize(), cfd[tid][WRITE]);
                     break;
                 }
                 case VIRTIO_CUDA_GETLASTERROR: {
@@ -1865,10 +1890,10 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                     break;
                 }
                 default:
-                    printf("No such cmd %d\n", cmd);
+                    error("No such cmd %d\n", cmd);
             }
         }
-        printf("child process finish\n");
+        debug("child process finish\n");
         exit(EXIT_SUCCESS);
     }
     close(pfd[tid][READ]);
@@ -1891,12 +1916,10 @@ static void virtconsole_guest_ready(VirtIOSerialPort *port)
     qemu_mutex_lock(&total_port_mutex);
     total_port = get_active_ports_nr(vser);
     qemu_mutex_unlock(&total_port_mutex);
-    if( total_port > WORKER_THREADS) {
+    if( total_port > WORKER_THREADS-1) {
         error("Too much ports, over %d\n", WORKER_THREADS);
         return;
     }
-    spawn_subprocess_by_port(port);
-    return;
 }
 
 /*
@@ -1921,6 +1944,7 @@ static void virtconsole_realize(DeviceState *dev, Error **errp)
     /* init GPU device
     */
     init_device(vser);
+    spawn_subprocess_by_port(port);
 
 }
 
@@ -1939,6 +1963,7 @@ static void virtconsole_unrealize(DeviceState *dev, Error **errp)
     if (vcon->watch) {
         g_source_remove(vcon->watch);
     }
+
 }
 
 static Property virtserialport_properties[] = {
