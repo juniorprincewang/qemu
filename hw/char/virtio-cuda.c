@@ -102,6 +102,7 @@ typedef struct VirtualObjectList {
 typedef struct HostVirtualObjectList {
     uint64_t native_addr;
     uint64_t actual_addr;
+    uint64_t virtual_addr;
     size_t size;
     struct list_head list;
     char file_path[64];
@@ -462,6 +463,16 @@ void handler(int sig)
     int status;
     pid=waitpid(-1, &status, 0);
     error("Pid %d exited.\n", pid);
+    if (WIFEXITED(status)) {
+        error("exited, status=%d\n", WEXITSTATUS(status));
+    } else if(WIFSIGNALED(status)) {
+        error("killed by signal %d\n", WTERMSIG(status));
+    } else if(WIFSTOPPED(status)) {
+        error("stopped by signal %d\n", WSTOPSIG(status));
+    } else if(WIFCONTINUED(status)) {
+        error("continued.\n");
+    }
+
 }
 
 static void cuda_register_function(VirtIOArg *arg, int tid)
@@ -667,14 +678,25 @@ out:
     return vol;
 }
 
+static HVOL *find_hvol_by_vaddr(uint64_t vaddr, CudaDev *dev)
+{
+    HVOL *hvol;
+    list_for_each_entry(hvol, &dev->host_vol, list) {
+        if(hvol->virtual_addr <= vaddr && vaddr < (hvol->virtual_addr+hvol->size) )
+            goto out;
+    }
+    hvol = NULL;
+out:
+    return hvol;
+}
+
 static uint64_t map_addr_by_vaddr(uint64_t vaddr, CudaDev *dev)
 {
     VOL *vol = find_vol_by_vaddr(vaddr, dev);
-    if(vol == NULL)
-        return 0;
-    return vol->addr + (vaddr - vol->v_addr);
+    if(vol != NULL)
+        return vol->addr + (vaddr - vol->v_addr);
+    return 0;
 }
-
 
 static void cuda_memcpy(VirtIOArg *arg, int tid)
 {
@@ -913,23 +935,40 @@ static void cuda_memcpy_async(VirtIOArg *arg, int tid)
         }
         free(src);
     } else if (arg->flag == cudaMemcpyDeviceToHost) {
-        dst = malloc(size);
-        if((addr=map_addr_by_vaddr(arg->src, &cudaDevices[tid]))==0) {
-            error("Failed to find virtual addr %p in vol\n",
+        if((src=(void*)map_addr_by_vaddr(arg->src, &cudaDevices[tid]))==0) {
+            error("Failed to find virtual addr %p in vol or hvol\n",
                   (void *)arg->src);
             arg->cmd = cudaErrorInvalidValue;
             return;
         }
-        src = (void*)addr;
+        /* try to fetch dst guest physical address*/
+        gpa_array = (uint64_t*)gpa_to_hva((hwaddr)arg->param2, blocks);
+        if(!gpa_array) {
+            error("No such dst physical address 0x%lx.\n", arg->param2);
+            arg->cmd = cudaErrorInvalidValue;
+            return;
+        }
 
+        dst = NULL;
+        void *gdst=NULL;
+        HVOL *hvol = find_hvol_by_vaddr(arg->dst, &cudaDevices[tid]);
+        if (hvol) {
+            int offset = arg->dst - hvol->virtual_addr;
+            dst = (void*)(hvol->actual_addr+offset);
+            gdst = (void*)(hvol->native_addr+ offset);
+        }
         // cuError( (err=cuMemcpyDtoHAsync((void *)dst, (CUdeviceptr)src, 
         //                                 size, stream)) );
+        debug("src = %p\n", src);
+        debug("dst = %p\n", dst);
+        debug("size = %x\n", size);
         int cmd = VIRTIO_CUDA_MEMCPY_ASYNC;
         write(pfd[tid][WRITE], &cmd, 4);
         write(pfd[tid][WRITE], &arg->flag, 4);
         write(pfd[tid][WRITE], &stream, sizeof(cudaStream_t));
         write(pfd[tid][WRITE], &size, 4);
         write(pfd[tid][WRITE], &src, sizeof(void *));
+        write(pfd[tid][WRITE], &dst, sizeof(void *));
 
         while(read(cfd[tid][READ], &err, sizeof(cudaError_t))==0);
         arg->cmd = err;
@@ -937,19 +976,14 @@ static void cuda_memcpy_async(VirtIOArg *arg, int tid)
             error("memcpy async DtoH error!\n");
             return;
         }
-        read(cfd[tid][READ], dst, size);
-
         // copy back to VM
-        gpa_array = (uint64_t*)gpa_to_hva((hwaddr)arg->dst, blocks);
-        if(!gpa_array) {
-            error("No such dst address.\n");
-            free(dst);
-            arg->cmd = cudaErrorInvalidValue;
-            return;
+        if (dst==NULL) {
+            gdst = malloc(size);
+            read(cfd[tid][READ], gdst, size);
         }
         uint32_t start_offset = init_offset % KMALLOC_SIZE;
         int len = min(size, KMALLOC_SIZE - start_offset);
-        cpu_physical_memory_write((hwaddr)gpa_array[0], dst, len);
+        cpu_physical_memory_write((hwaddr)gpa_array[0], gdst, len);
         int rsize=size;
         uint32_t offset=len;
         rsize-=len;
@@ -957,12 +991,13 @@ static void cuda_memcpy_async(VirtIOArg *arg, int tid)
         while(rsize) {
             len=min(rsize, KMALLOC_SIZE);
             cpu_physical_memory_write((hwaddr)gpa_array[i++], 
-                                      dst+offset, len);
+                                      gdst+offset, len);
             offset+=len;
             rsize-=len;
         }
         assert(i == blocks);
-        free(dst);
+        if (dst == NULL)
+            free(gdst);
     } else if (arg->flag == cudaMemcpyDeviceToDevice) {
         if((addr=map_addr_by_vaddr(arg->src, &cudaDevices[tid]))==0) {
             error("Failed to find virtual addr %p in vol\n",
@@ -1121,8 +1156,6 @@ static void cuda_host_register(VirtIOArg *arg, int tid)
     cudaError_t err=-1;
     size_t size;
     void *src;
-    uint64_t *gpa_array=NULL;
-    int i=0;
     char file_path[64];
 
     func();
@@ -1140,35 +1173,7 @@ static void cuda_host_register(VirtIOArg *arg, int tid)
         arg->cmd = cudaErrorMemoryAllocation;
         return;
     }
-    
-    if(arg->param) {
-        int blocks = arg->param;
-        gpa_array = (uint64_t*)gpa_to_hva((hwaddr)arg->src, blocks);
-        if(!gpa_array) {
-            error("Failed to translate addr.\n");
-            arg->cmd = cudaErrorInvalidValue;
-            return;
-        }
-        uint32_t offset = arg->dstSize;
-        uint32_t start_offset = offset % KMALLOC_SIZE;
-        int len = min(size, KMALLOC_SIZE - start_offset);
 
-        cpu_physical_memory_read((hwaddr)gpa_array[0], src, len);
-        int rsize=size;
-        rsize-=len;
-        offset=len;
-        i=1;
-        while(rsize) {
-            len=min(rsize, KMALLOC_SIZE);
-            cpu_physical_memory_read((hwaddr)gpa_array[i++],
-                                     src+offset, len);
-            offset+=len;
-            rsize-=len;
-        }
-        assert(i == blocks);
-    } else {
-        cpu_physical_memory_read((hwaddr)arg->src, src, size);
-    }
     int cmd = VIRTIO_CUDA_HOSTREGISTER;
     write(pfd[tid][WRITE], &cmd, 4);
     write(pfd[tid][WRITE], &arg->flag, sizeof(unsigned int));
@@ -1184,6 +1189,7 @@ static void cuda_host_register(VirtIOArg *arg, int tid)
     HVOL *hvol = (HVOL *)malloc(sizeof(HVOL));
     hvol->actual_addr = (uint64_t)actual_addr;
     hvol->native_addr = (uint64_t)src;
+    hvol->virtual_addr = arg->src;
     hvol->size = size;
     memcpy(hvol->file_path, file_path, 64);
     list_add_tail(&hvol->list, &cudaDevices[tid].host_vol);
@@ -1192,7 +1198,6 @@ static void cuda_host_register(VirtIOArg *arg, int tid)
 static void cuda_host_unregister(VirtIOArg *arg, int tid)
 {
     cudaError_t err=-1;
-    uint32_t size;
     char file_path[64];
 
     func();
@@ -1200,7 +1205,6 @@ static void cuda_host_unregister(VirtIOArg *arg, int tid)
           "dstSize=0x%x, kind=0x%lx, param=0x%lx\n",
           arg->src, arg->srcSize, arg->dst, 
           arg->dstSize, arg->flag, arg->param);
-    size = arg->srcSize;
 
     sprintf(file_path, "/qemu-%d-%lx", tid, arg->src);
 
@@ -1212,19 +1216,20 @@ static void cuda_host_unregister(VirtIOArg *arg, int tid)
 
     HVOL *hvol, *hvol2;
     list_for_each_entry_safe(hvol, hvol2, &cudaDevices[tid].host_vol, list) {
-        if (strcmp(hvol->file_path, file_path)==0) {
-            debug(  "actual devPtr=0x%lx, virtual ptr=0x%lx\n", 
-                    (uint64_t)hvol->actual_addr, (uint64_t)hvol->native_addr);
+        if (strcmp(hvol->file_path, file_path)==0 && 
+            hvol->virtual_addr == arg->src ) {
+            debug(  "actual actual addr=0x%lx, virtual ptr=0x%lx\n", 
+                    (uint64_t)hvol->actual_addr, (uint64_t)hvol->virtual_addr);
             int cmd = VIRTIO_CUDA_HOSTUNREGISTER;
             write(pfd[tid][WRITE], &cmd, 4);
             write(pfd[tid][WRITE], &hvol->actual_addr, sizeof(uint64_t));
             while(read(cfd[tid][READ], &err, sizeof(cudaError_t))==0);
+            arg->cmd = err;
             if (err != cudaSuccess) {
                 error("free error.\n");
             }
             list_del(&hvol->list);
-            unset_shm((void*)hvol->actual_addr, size, file_path);
-            arg->cmd = err;
+            unset_shm((void*)hvol->native_addr, hvol->size, file_path);
             return;
         }
     }
@@ -1862,7 +1867,6 @@ static void virtconsole_enable_backend(VirtIOSerialPort *port, bool enable)
         */
         int cmd = 0;
         write(pfd[thread_id][WRITE], &cmd, 4);
-        wait(NULL);
         return;
     }
     if(enable && !global_deinitialized)
@@ -1950,22 +1954,25 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                 }
                 case VIRTIO_CUDA_UNREGISTERFATBINARY: {
                     cuCheck(cuCtxDestroy(cuContext), cfd[tid][WRITE]);
-
+                    break;
+                }
+                case VIRTIO_CUDA_SETDEVICE: {
+                    int dev = 0;
+                    read(pfd[tid][READ], &dev, 4);
+                    cudaCheck(cudaSetDevice(dev), cfd[tid][WRITE]);
+                    break;
+                }
+                case VIRTIO_CUDA_SETDEVICEFLAGS: {
+                    unsigned int flags;
+                    read(pfd[tid][READ], &flags, sizeof(unsigned int));
+                    cudaCheck(cudaSetDeviceFlags(flags), cfd[tid][WRITE]);
+                    break;
+                }
+                case VIRTIO_CUDA_DEVICERESET: {
+                    cudaCheck(cudaDeviceReset(), cfd[tid][WRITE]);
                     break;
                 }
                 case VIRTIO_CUDA_REGISTERFUNCTION: {
-                    // read(pfd[tid][READ], &data_len, 4);
-                    // void *fat_bin = malloc(data_len);
-                    // read(pfd[tid][READ], fat_bin, data_len);
-                    // cuCheck( cuModuleLoadData(&module, fat_bin), cfd[tid][WRITE]);
-
-                    // read(pfd[tid][READ], &data_len, 4);
-                    // void * func_name = malloc(data_len);
-                    // read(pfd[tid][READ], func_name, data_len);
-                    // cuCheck( cuModuleGetFunction(&kernel_func,
-                    //                             module,
-                    //                             func_name) , cfd[tid][WRITE]);
-                    // write(cfd[tid][WRITE], &kernel_func, sizeof(CUfunction));
                     break;
                 }
                 case VIRTIO_CUDA_MALLOC: {
@@ -2046,14 +2053,21 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                         // cuError( (err=cuMemcpyDtoHAsync((void *)dst, (CUdeviceptr)src, 
                         //                                 size, stream)) );
                         CUdeviceptr src;
-                        void *dst;
+                        void *dst=NULL;
                         read(pfd[tid][READ], &stream, sizeof(CUstream));
                         read(pfd[tid][READ], &bytecount, 4);
-                        dst = malloc(bytecount);
                         read(pfd[tid][READ], &src, sizeof(CUdeviceptr));
+                        read(pfd[tid][READ], &dst, sizeof(void *));
+                        debug("bytecount is %lx\n", bytecount);
+                        debug("src is %llx\n", src);
+                        debug("dst is %p\n", dst);
+                        if (dst == NULL)
+                            dst = malloc(bytecount);
                         cuCheck(cuMemcpyDtoHAsync(dst, src, bytecount, stream), cfd[tid][WRITE]);
-                        write(cfd[tid][WRITE], dst, bytecount);
-                        free(dst);
+                        if (dst == NULL) {
+                            write(cfd[tid][WRITE], dst, bytecount);
+                            free(dst);
+                        }
                     } else if (direction == cudaMemcpyDeviceToDevice) {
                         // cuError( (err=cuMemcpyDtoDAsync((CUdeviceptr)dst, (CUdeviceptr)src, 
                         //                                 size, stream)) );
@@ -2114,32 +2128,6 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                                             NULL) , cfd[tid][WRITE]);
                     free(para);
                     free(para_buf);
-                    break;
-                }
-                case VIRTIO_CUDA_SETDEVICE: {
-                    int dev = 0;
-                    read(pfd[tid][READ], &dev, 4);
-                    cudaCheck(cudaSetDevice(dev), cfd[tid][WRITE]);
-                    /*
-                    // pick up device with zero ordinal (default, or devID)
-                    err=cuDeviceGet(&cuDevice, dev);
-                    if (err != cudaSuccess)
-                    {
-                        exit(EXIT_FAILURE);
-                    }
-                    // Create context
-                    err =cuCtxCreate(&cuContext, 0, cuDevice);
-                    if (err != cudaSuccess)
-                    {
-                        exit(EXIT_FAILURE);
-                    }
-                    */
-                    break;
-                }
-                case VIRTIO_CUDA_SETDEVICEFLAGS: {
-                    unsigned int flags;
-                    read(pfd[tid][READ], &flags, sizeof(unsigned int));
-                    cudaCheck(cudaSetDeviceFlags(flags), cfd[tid][WRITE]);
                     break;
                 }
                 case VIRTIO_CUDA_MEMGETINFO: {
@@ -2212,10 +2200,6 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                     write(cfd[tid][WRITE], &time, sizeof(float));
                     break;
                 }
-                case VIRTIO_CUDA_DEVICERESET: {
-                    cudaCheck(cudaDeviceReset(), cfd[tid][WRITE]);
-                    break;
-                }
                 case VIRTIO_CUDA_HOSTREGISTER: {
                     unsigned int flags;
                     size_t size;
@@ -2231,12 +2215,14 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                     }
                     cudaCheck(cudaHostRegister(addr, size, flags), cfd[tid][WRITE]);
                     write(cfd[tid][WRITE], &addr, sizeof(void *));
+                    debug("host register addr=%p\n", addr);
                     break;
                 }
                 case VIRTIO_CUDA_HOSTUNREGISTER: {
                     void *addr;
                     read(pfd[tid][READ], &addr, sizeof(void *));
                     cudaCheck(cudaHostUnregister(addr), cfd[tid][WRITE]);
+                    // munmap
                     break;
                 }
                 default:
