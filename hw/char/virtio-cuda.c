@@ -759,9 +759,9 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
         write(pfd[tid][WRITE], &src, sizeof(void *));
 
         while(read(cfd[tid][READ], &err, sizeof(cudaError_t))==0);
+        arg->cmd = err;
         if (cudaSuccess != err) {
             error("memcpy error!\n");
-            arg->cmd = err;
             return;
         }
         read(cfd[tid][READ], dst, size);
