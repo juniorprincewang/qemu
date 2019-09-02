@@ -31,7 +31,8 @@
 #include "cuda.h"
 #include "cuda_runtime.h"
 
-#define func() printf("[FUNC]%s\n",__FUNCTION__)
+// #define func() printf("[FUNC]%s\n",__FUNCTION__)
+#define func() 
 
 static struct VirtIOSerialDevices {
     QLIST_HEAD(, VirtIOSerial) devices;

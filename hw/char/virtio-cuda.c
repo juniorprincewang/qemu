@@ -887,29 +887,6 @@ static void cuda_memcpy_async(VirtIOArg *arg, int tid)
     debug("stream 0x%lx\n", (uint64_t)stream);
     size = arg->srcSize;
     if (arg->flag == cudaMemcpyHostToDevice) {
-        src = malloc(size);
-        gpa_array = (uint64_t*)gpa_to_hva((hwaddr)arg->src, blocks);
-        if(!gpa_array) {
-            error("No such addr!\n");
-            free(src);
-            arg->cmd=cudaErrorInvalidValue;
-            return;
-        }
-        uint32_t start_offset = init_offset % KMALLOC_SIZE;
-        int len = min(size, KMALLOC_SIZE - start_offset);
-        cpu_physical_memory_read((hwaddr)gpa_array[0], src, len);
-        int rsize=size;
-        int offset=len;
-        rsize-=len;
-        i=1;
-        while(rsize) {
-            len=min(rsize, KMALLOC_SIZE);
-            cpu_physical_memory_read((hwaddr)gpa_array[i++],
-                                     src+offset, len);
-            offset+=len;
-            rsize-=len;
-        }
-        assert(i == blocks);
         
         if((addr=map_addr_by_vaddr(arg->dst, &cudaDevices[tid]))==0) {
             error("Failed to find dst virtual addr %p in vol\n",
@@ -918,6 +895,41 @@ static void cuda_memcpy_async(VirtIOArg *arg, int tid)
             return;
         }
         dst = (void *)addr;
+        /* try to fetch dst guest physical address*/
+        gpa_array = (uint64_t*)gpa_to_hva((hwaddr)arg->param2, blocks);
+        if(!gpa_array) {
+            error("No such dst physical address 0x%lx.\n", arg->param2);
+            arg->cmd=cudaErrorInvalidValue;
+            return;
+        }
+        src = NULL;
+        void *gsrc=NULL;
+        HVOL *hvol = find_hvol_by_vaddr(arg->src, &cudaDevices[tid]);
+        if (hvol) {
+            int offsets = arg->src - hvol->virtual_addr;
+            src = (void*)(hvol->actual_addr + offsets);
+            gsrc = (void*)(hvol->native_addr + offsets);
+        }
+        if (src==NULL) {
+            gsrc = malloc(size);
+        }
+
+        uint32_t start_offset = init_offset % KMALLOC_SIZE;
+        int len = min(size, KMALLOC_SIZE - start_offset);
+        cpu_physical_memory_read((hwaddr)gpa_array[0], gsrc, len);
+        int rsize=size;
+        int offset=len;
+        rsize-=len;
+        i=1;
+        while(rsize) {
+            len=min(rsize, KMALLOC_SIZE);
+            cpu_physical_memory_read((hwaddr)gpa_array[i++],
+                                     gsrc+offset, len);
+            offset+=len;
+            rsize-=len;
+        }
+        assert(i == blocks);
+        
         // cuError( (err= cuMemcpyHtoDAsync((CUdeviceptr)dst, (void *)src, size, 
                                          // stream)));
         int cmd = VIRTIO_CUDA_MEMCPY_ASYNC;
@@ -925,7 +937,9 @@ static void cuda_memcpy_async(VirtIOArg *arg, int tid)
         write(pfd[tid][WRITE], &arg->flag, 4);
         write(pfd[tid][WRITE], &stream, sizeof(cudaStream_t));
         write(pfd[tid][WRITE], &size, 4);
-        write(pfd[tid][WRITE], src, size);
+        write(pfd[tid][WRITE], &src, sizeof(void *));
+        if(src==NULL)
+            write(pfd[tid][WRITE], &gsrc, size);
         write(pfd[tid][WRITE], &dst, sizeof(void *));
 
         while(read(cfd[tid][READ], &err, sizeof(cudaError_t))==0);
@@ -933,7 +947,8 @@ static void cuda_memcpy_async(VirtIOArg *arg, int tid)
         if(err != cudaSuccess) {
             error("memcpy async HtoD error!\n");
         }
-        free(src);
+        if (src == NULL)
+            free(gsrc);
     } else if (arg->flag == cudaMemcpyDeviceToHost) {
         if((src=(void*)map_addr_by_vaddr(arg->src, &cudaDevices[tid]))==0) {
             error("Failed to find virtual addr %p in vol or hvol\n",
@@ -953,9 +968,9 @@ static void cuda_memcpy_async(VirtIOArg *arg, int tid)
         void *gdst=NULL;
         HVOL *hvol = find_hvol_by_vaddr(arg->dst, &cudaDevices[tid]);
         if (hvol) {
-            int offset = arg->dst - hvol->virtual_addr;
-            dst = (void*)(hvol->actual_addr+offset);
-            gdst = (void*)(hvol->native_addr+ offset);
+            int offsets = arg->dst - hvol->virtual_addr;
+            dst = (void*)(hvol->actual_addr+offsets);
+            gdst = (void*)(hvol->native_addr+ offsets);
         }
         // cuError( (err=cuMemcpyDtoHAsync((void *)dst, (CUdeviceptr)src, 
         //                                 size, stream)) );
@@ -1019,9 +1034,9 @@ static void cuda_memcpy_async(VirtIOArg *arg, int tid)
         write(pfd[tid][WRITE], &cmd, 4);
         write(pfd[tid][WRITE], &arg->flag, 4);
         write(pfd[tid][WRITE], &stream, sizeof(cudaStream_t));
+        write(pfd[tid][WRITE], &size, 4);
         write(pfd[tid][WRITE], &src, sizeof(void *));
         write(pfd[tid][WRITE], &dst, sizeof(void *));
-        write(pfd[tid][WRITE], &size, 4);
 
         while(read(cfd[tid][READ], &err, sizeof(cudaError_t))==0);
         if (err != cudaSuccess) {
@@ -1166,7 +1181,7 @@ static void cuda_host_register(VirtIOArg *arg, int tid)
     size = arg->srcSize;
 
     sprintf(file_path, "/qemu-%d-%lx", tid, arg->src);
-    printf("file path = %s\n", file_path);
+    debug("file path = %s\n", file_path);
     src = set_shm(size, file_path);
     if (src == NULL) {
         error("Failed to allocate share memroy.\n");
@@ -1871,7 +1886,6 @@ static void virtconsole_enable_backend(VirtIOSerialPort *port, bool enable)
     }
     if(enable && !global_deinitialized)
         global_deinitialized = 1;
-
     return ;
 }
 
@@ -1913,9 +1927,9 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
         int i=0;
         // cuda variable
         int devID = 0;
-        CUdevice cuDevice;
-        CUcontext cuContext;
-        CUmodule module;
+        CUdevice cuDevice   =   0;
+        CUcontext cuContext =   0;
+        CUmodule module     =   0;
         CUfunction kernel_func;
         cudaError_t err;
         // kernel
@@ -1926,16 +1940,19 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
         //
         uint64_t addr;
 
+        cuInit(0);
         while (1) {
             while(read(pfd[tid][READ], &cmd, 4) == 0);
             if(cmd==0)
                 break;
             switch(cmd) {
                 case VIRTIO_CUDA_REGISTERFATBINARY: {
-                    err = cuInit(0);
-                    if (err != cudaSuccess)
-                    {
-                        exit(EXIT_FAILURE);
+                    CUcontext context=NULL;
+                    err = cuCtxGetCurrent(&context);
+                    if (context != NULL) {
+                        debug("already have context %p\n", context);
+                        write(cfd[tid][WRITE], &err, sizeof(cudaError_t));
+                        break;
                     }
                     // pick up device with zero ordinal (default, or devID)
                     err=cuDeviceGet(&cuDevice, devID);
@@ -1953,12 +1970,36 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                     break;
                 }
                 case VIRTIO_CUDA_UNREGISTERFATBINARY: {
-                    cuCheck(cuCtxDestroy(cuContext), cfd[tid][WRITE]);
+                    CUcontext context=NULL;
+                    cuCtxGetCurrent(&context);
+                    if (context != NULL) {
+                        // debug("Try to destroy context %lx\n", (uint64_t)context);
+                        err = cuCtxPopCurrent(&context);
+                        if (err != cudaSuccess)
+                        {
+                            exit(EXIT_FAILURE);
+                        }
+                        cuCheck(cuCtxDestroy(context), cfd[tid][WRITE]);
+                        // cudaDeviceReset();
+                    }
                     break;
                 }
                 case VIRTIO_CUDA_SETDEVICE: {
                     int dev = 0;
                     read(pfd[tid][READ], &dev, 4);
+                    err=cuDeviceGet(&cuDevice, dev);
+                    if (err != cudaSuccess)
+                    {
+                        error("Failed to get device %d\n", dev);
+                        exit(EXIT_FAILURE);
+                    }
+                    // Create context
+                    err =cuCtxCreate(&cuContext, 0, cuDevice);
+                    if (err != cudaSuccess)
+                    {
+                        error("Failed to create context.\n");
+                        exit(EXIT_FAILURE);
+                    }
                     cudaCheck(cudaSetDevice(dev), cfd[tid][WRITE]);
                     break;
                 }
@@ -1981,8 +2022,8 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                     CUdeviceptr ptr;
                     read(pfd[tid][READ], &size, sizeof(size_t));
                     debug("allocate 0x%lx\n", size);
-                    // cudaCheck(cudaMalloc((void **)&devPtr, size), cfd[tid][1]);
-                    cuCheck(cuMemAlloc(&ptr, size), cfd[tid][WRITE]);
+                    cudaCheck(cudaMalloc((void **)&ptr, size), cfd[tid][WRITE]);
+                    // cuCheck(cuMemAlloc(&ptr, size), cfd[tid][WRITE]);
                     write(cfd[tid][WRITE], &ptr, sizeof(CUdeviceptr));
                     break;
                 }
@@ -2036,37 +2077,45 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                     int direction;
                     read(pfd[tid][READ], &direction, 4);
                     CUstream stream;
-                    size_t bytecount;
+                    int bytecount;
                     if (direction == cudaMemcpyHostToDevice) {
                         // cuError( (err= cuMemcpyHtoDAsync((CUdeviceptr)dst, (void *)src, size, 
                                          // stream)));
                         CUdeviceptr dst;
-                        void *src;
+                        void *src, *hsrc;
                         read(pfd[tid][READ], &stream, sizeof(CUstream));
                         read(pfd[tid][READ], &bytecount, 4);
-                        src = malloc(bytecount);
-                        read(pfd[tid][READ], src, bytecount);
+                        read(pfd[tid][READ], &src, sizeof(void *));
+                        if (src == NULL) {
+                            hsrc = malloc(bytecount);
+                            read(pfd[tid][READ], hsrc, bytecount);
+                        } else
+                            hsrc = src;
                         read(pfd[tid][READ], &dst, sizeof(CUdeviceptr));
-                        cuCheck(cuMemcpyHtoDAsync(dst, src, bytecount, stream), cfd[tid][WRITE]);
-                        free(src);
+                        cuCheck(cuMemcpyHtoDAsync(dst, hsrc, bytecount, stream), cfd[tid][WRITE]);
+                        if (src == NULL) {
+                            free(hsrc);
+                        }
                     } else if (direction == cudaMemcpyDeviceToHost) {
                         // cuError( (err=cuMemcpyDtoHAsync((void *)dst, (CUdeviceptr)src, 
                         //                                 size, stream)) );
                         CUdeviceptr src;
-                        void *dst=NULL;
+                        void *dst=NULL, *ddst;
                         read(pfd[tid][READ], &stream, sizeof(CUstream));
                         read(pfd[tid][READ], &bytecount, 4);
                         read(pfd[tid][READ], &src, sizeof(CUdeviceptr));
                         read(pfd[tid][READ], &dst, sizeof(void *));
-                        debug("bytecount is %lx\n", bytecount);
+                        debug("bytecount is %x\n", bytecount);
                         debug("src is %llx\n", src);
                         debug("dst is %p\n", dst);
                         if (dst == NULL)
-                            dst = malloc(bytecount);
-                        cuCheck(cuMemcpyDtoHAsync(dst, src, bytecount, stream), cfd[tid][WRITE]);
+                            ddst = malloc(bytecount);
+                        else 
+                            ddst = dst;
+                        cuCheck(cuMemcpyDtoHAsync(ddst, src, bytecount, stream), cfd[tid][WRITE]);
                         if (dst == NULL) {
-                            write(cfd[tid][WRITE], dst, bytecount);
-                            free(dst);
+                            write(cfd[tid][WRITE], ddst, bytecount);
+                            free(ddst);
                         }
                     } else if (direction == cudaMemcpyDeviceToDevice) {
                         // cuError( (err=cuMemcpyDtoDAsync((CUdeviceptr)dst, (CUdeviceptr)src, 
@@ -2074,9 +2123,9 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                         CUdeviceptr dst;
                         CUdeviceptr src;
                         read(pfd[tid][READ], &stream, sizeof(CUstream));
+                        read(pfd[tid][READ], &bytecount, 4);
                         read(pfd[tid][READ], &src, sizeof(CUdeviceptr));
                         read(pfd[tid][READ], &dst, sizeof(CUdeviceptr));
-                        read(pfd[tid][READ], &bytecount, 4);
                         cuCheck(cuMemcpyDtoDAsync(dst, src, bytecount, stream), cfd[tid][WRITE]);
                     }
                     break;
