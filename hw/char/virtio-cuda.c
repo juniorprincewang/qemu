@@ -88,9 +88,10 @@ typedef struct VirtConsole {
     guint watch;
 } VirtConsole;
 
-#define CudaModuleMaxNum 8
-#define CudaFunctionMaxNum 32
-#define CudaVariableMaxNum 32
+#define CudaContextMaxNum   8
+#define CudaModuleMaxNum    8
+#define CudaFunctionMaxNum  32
+#define CudaVariableMaxNum  32
 
 #define CudaEventMaxNum BITS_PER_WORD
 #define CudaStreamMaxNum BITS_PER_WORD
@@ -151,7 +152,6 @@ typedef struct CudaGlobalMem
 
 typedef struct CUModuleContext
 {
-    char            moduleName[NAME_LEN];
     CudaKernel      cudaKernels[CudaFunctionMaxNum];  // stores the data, strings for the CUDA kernels
     CudaGlobalMem   globalMem[CudaVariableMaxNum];     // stores the data, strings for the Global Memory (Device Pointers)
     CUmodule        module;
@@ -161,6 +161,14 @@ typedef struct CUModuleContext
     int             cudaKernelsCount;
     int             globalMemCount;
 } CudaModule;
+
+typedef struct CUDeviceContext
+{
+    CUdevice        dev;
+    CUcontext       context;
+    CudaModule      modules[CudaModuleMaxNum];
+    int             moduleCount;
+}CudaContext;
 
 static int total_device;   // total GPU device
 static int total_port;     // port count
@@ -455,17 +463,21 @@ static void cuda_register_fatbinary(VirtIOArg *arg, int tid)
     void *fat_bin;
     uint32_t fatbin_size = arg->srcSize;
     int m_num = cudaModuleNum[tid];
+    size_t handle = (size_t)arg->src;
     func();
     // check out hmac
-    if( (fat_bin=gpa_to_hva((hwaddr)arg->dst, fatbin_size))==NULL)
+    if( (fat_bin=gpa_to_hva((hwaddr)arg->dst, fatbin_size))==NULL) {
+        error("Failed to translate address in fatbinary registeration!\n");
+        arg->cmd = cudaErrorUnknown;
         return;
+    }
 
     // fat_bin = malloc(fatbin_size);
     // cpu_physical_memory_read((hwaddr)arg->dst, fat_bin, fatbin_size);
 
     debug("fat_bin gpa is 0x%lx\n", *(uint64_t*)fat_bin);
     debug("fat_bin gva is 0x%lx\n", (uint64_t)arg->src);
-    cudaModules[tid][m_num].handle      = (size_t)arg->src;
+    cudaModules[tid][m_num].handle      = handle;
     cudaModules[tid][m_num].fatbin_size = fatbin_size;
     cudaModules[tid][m_num].cudaKernelsCount = 0;
     cudaModules[tid][m_num].globalMemCount = 0;
@@ -482,12 +494,13 @@ static void cuda_register_fatbinary(VirtIOArg *arg, int tid)
     write(pfd[tid][WRITE], &cmd, 4);
     write(pfd[tid][WRITE], &fatbin_size, 4);
     write(pfd[tid][WRITE], fat_bin, fatbin_size);
+    write(pfd[tid][WRITE], &handle, sizeof(size_t));
     while(read(cfd[tid][READ], &err, sizeof(cudaError_t))==0);
     if (err != cudaSuccess) {
         error("Failed to register fatbinary!\n");
     }
     arg->cmd = err;
-    read(cfd[tid][READ], &cudaModules[tid][m_num].module, sizeof(CUmodule));
+    // read(cfd[tid][READ], &cudaModules[tid][m_num].module, sizeof(CUmodule));
     cudaModuleNum[tid]++;  
 }
 
@@ -594,16 +607,18 @@ static void cuda_register_function(VirtIOArg *arg, int tid)
     //     &kernel->kernel_func,
     //     kernel->module,
     //     kernel->func_name) );
+    write(pfd[tid][WRITE], &fatbin_handle, sizeof(size_t));
     write(pfd[tid][WRITE], &kernel->func_name_size, 4);
     write(pfd[tid][WRITE], kernel->func_name, kernel->func_name_size);
-    write(pfd[tid][WRITE], &cuda_module->module, sizeof(CUmodule));
+    write(pfd[tid][WRITE], &func_id, sizeof(size_t));
     read(cfd[tid][READ], &err, sizeof(cudaError_t));
     if (err != cudaSuccess) {
         error("register function failed\n");
         arg->cmd = err;
         return;
     }
-    read(cfd[tid][READ], &kernel->kernel_func, sizeof(CUfunction));
+    // read(cfd[tid][READ], &kernel->kernel_func, sizeof(CUfunction));
+    // debug("kernel_func=0x%lx\n", (uint64_t)kernel->kernel_func);
     arg->cmd = cudaSuccess;
 }
 
@@ -667,18 +682,19 @@ static void cuda_register_var(VirtIOArg *arg, int tid)
     write(pfd[tid][WRITE], &cmd, 4);
     // cuError( cuModuleGetGlobal(
     //     &dptr, &bytes, module, name) );
+    write(pfd[tid][WRITE], &cuda_module->handle, sizeof(size_t));
     write(pfd[tid][WRITE], &var->addr_name_size, 4);
     write(pfd[tid][WRITE], var->addr_name, var->addr_name_size);
-    write(pfd[tid][WRITE], &cuda_module->module, sizeof(CUmodule));
+    write(pfd[tid][WRITE], &host_var, sizeof(size_t));
     read(cfd[tid][READ], &err, sizeof(cudaError_t));
     if (err != cudaSuccess) {
         error("register var failed\n");
         arg->cmd = err;
         return;
     }
-    read(cfd[tid][READ], &var->device_ptr, sizeof(CUdeviceptr));
-    read(cfd[tid][READ], &var->mem_size, sizeof(size_t));
-    debug("device ptr=0x%llx, size=0x%lx\n", var->device_ptr, var->mem_size);
+    // read(cfd[tid][READ], &var->device_ptr, sizeof(CUdeviceptr));
+    // read(cfd[tid][READ], &var->mem_size, sizeof(size_t));
+    // debug("device ptr=0x%llx, size=0x%lx\n", var->device_ptr, var->mem_size);
     arg->cmd = cudaSuccess;
 }
 
@@ -696,31 +712,30 @@ static void cuda_launch(VirtIOArg *arg, int tid)
     int m_num       = cudaModuleNum[tid];
     int i           = 0;
     int j           = 0;
-    CudaModule *cuda_module;
-    CudaKernel *kernel;
-    size_t fatbin_handle;
+    CudaModule *cuda_module = NULL;
+    CudaKernel *kernel = NULL;
+    size_t func_handle;
     size_t kernel_count = 0;
-    bool found = 0;
     // hwaddr gpa_para = (hwaddr)(arg->src);
     // hwaddr gpa_conf = (hwaddr)(arg->dst);
     func();
     debug("thread id = %u\n", tid);
 
-    fatbin_handle = (size_t)arg->flag;
-    debug(" func_id = %zu\n", fatbin_handle);
+    func_handle = (size_t)arg->flag;
+    debug(" func_id = 0x%lx\n", func_handle);
 
     for (i=0; i < m_num; i++) {
         cuda_module = &cudaModules[tid][i];
         kernel_count = cuda_module->cudaKernelsCount;
         for (j=0; j < kernel_count; j++) {
-            kernel = &cuda_module->cudaKernels[j];
-            if (kernel->func_id == fatbin_handle) {
-                found = 1;
+            if (cuda_module->cudaKernels[j].func_id == func_handle) {
+                kernel = &cuda_module->cudaKernels[j];
+                debug("Found func_id=0x%lx\n", func_handle);
                 break;
             }
         }
     }
-    if (found == 0) {
+    if (!kernel) {
         error("Failed to find func id.\n");
         arg->cmd = cudaErrorNoKernelImageForDevice;
         return;
@@ -755,8 +770,10 @@ static void cuda_launch(VirtIOArg *arg, int tid)
     void *p=NULL;
     para_idx = sizeof(uint32_t);
     for(i=0; i<para_num; i++) {
-        if(*(uint32_t*)(&para[para_idx]) != sizeof(uint64_t))
+        if(*(uint32_t*)(&para[para_idx]) != sizeof(uint64_t)) {
+            para_idx += *(uint32_t*)(&para[para_idx]) + sizeof(uint32_t);
             continue;
+        }
         p = &para[para_idx + sizeof(uint32_t)];
         uint64_t addr = map_addr_by_vaddr(  *(uint64_t*)p, 
                                             &cudaDevices[tid]);
@@ -795,7 +812,7 @@ static void cuda_launch(VirtIOArg *arg, int tid)
 
     int cmd =VIRTIO_CUDA_LAUNCH;
     write(pfd[tid][WRITE], &cmd, 4);
-    write(pfd[tid][WRITE], &kernel->kernel_func, sizeof(CUfunction));
+    write(pfd[tid][WRITE], &kernel->func_id,    sizeof(size_t));
     write(pfd[tid][WRITE], &conf->gridDim,      sizeof(dim3));
     write(pfd[tid][WRITE], &conf->blockDim,     sizeof(dim3));
     write(pfd[tid][WRITE], &conf->sharedMem,    sizeof(size_t));
@@ -1275,7 +1292,7 @@ static void cuda_memcpy_to_symbol(VirtIOArg *arg, int tid)
     write(pfd[tid][WRITE], &cmd, 4);
     write(pfd[tid][WRITE], &size, sizeof(size_t));
     write(pfd[tid][WRITE], src, size);
-    write(pfd[tid][WRITE], &var->device_ptr, sizeof(CUdeviceptr));
+    write(pfd[tid][WRITE], &var_handle, sizeof(size_t));
     write(pfd[tid][WRITE], &var_offset, sizeof(size_t));
     read(cfd[tid][READ], &err, sizeof(cudaError_t));
     arg->cmd = err;
@@ -1332,7 +1349,7 @@ static void cuda_memcpy_from_symbol(VirtIOArg *arg, int tid)
 
     write(pfd[tid][WRITE], &cmd, 4);
     write(pfd[tid][WRITE], &size, sizeof(size_t));
-    write(pfd[tid][WRITE], &var->device_ptr, sizeof(CUdeviceptr));
+    write(pfd[tid][WRITE], &var_handle, sizeof(size_t));
     write(pfd[tid][WRITE], &var_offset, sizeof(size_t));
     read(cfd[tid][READ], &err, sizeof(cudaError_t));
     arg->cmd = err;
@@ -2235,6 +2252,31 @@ static void guest_writable(VirtIOSerialPort *port)
     return;
 }
 
+static void init_device_module(CudaContext *ctx)
+{
+    int i=0, j=0;
+    CudaModule *module = NULL;
+    CudaKernel *kernel = NULL;
+    CudaGlobalMem *var = NULL;
+    debug("sub module number = %d\n", ctx->moduleCount);
+    for (i=0; i < ctx->moduleCount; i++) {
+        module = &ctx->modules[i];
+        if (!module)
+            return;
+        cuError(cuModuleLoadData(&module->module, module->fatbin));
+        debug("kernel count = %d\n", module->cudaKernelsCount);
+        for(j=0; j<module->cudaKernelsCount; j++) {
+            kernel = &module->cudaKernels[j];
+            cuError(cuModuleGetFunction(&kernel->kernel_func, module->module, kernel->func_name));
+        }
+        debug("var count = %d\n", module->globalMemCount);
+        for(j=0; j<module->globalMemCount; j++) {
+            var = &module->globalMem[j];
+            cuError(cuModuleGetGlobal(&var->device_ptr, &var->mem_size, module->module, var->addr_name));
+        }
+    }
+}
+
 static void spawn_subprocess_by_port(VirtIOSerialPort *port)
 {
     pid_t cpid =0;
@@ -2252,8 +2294,6 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
     memset(cudaEvent[tid], 0, sizeof(cudaEvent_t)*CudaEventMaxNum);
     memset(cudaStream[tid], 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
     cudaModuleNum[tid]=0;
-    
-
 
     my_signal(SIGCHLD, handler);
 
@@ -2266,10 +2306,6 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
         int cmd;
         int data_len=0;
         int i=0;
-        CUcontext cuContext[8];
-        CUmodule module         = 0;
-        CUfunction kernel_func  = 0;
-        CUdeviceptr dptr        = 0;
         // kernel
         dim3 gridDim;
         dim3 blockDim;
@@ -2277,26 +2313,31 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
         cudaStream_t stream;
         //
         uint64_t addr;
-        cudaError_t err = cudaSuccess;
+        cudaError_t err     = cudaSuccess;
         int deviceCount     = 0;
-        int hcuDevice       = 0;
+
+        CudaContext *subContext = NULL;
+        int subModuleNum        = 0;
+        int DEFAULT_DEVICE      = 0;
+        int CUR_DEVICE          = DEFAULT_DEVICE;
+        unsigned char MODULE_LOAD_MAP=0x00;
 
         cuErrorExit(cuInit(0));
         cuErrorExit(cuDeviceGetCount(&deviceCount));
         debug("> %d CUDA device(s)\n", deviceCount);
         if (deviceCount == 0)
             exit(EXIT_FAILURE);
-
-        for (int iDevice = 0; iDevice < deviceCount; iDevice++)
+        subContext = (CudaContext*)malloc(sizeof(CudaContext)*deviceCount);
+        for (i = 0; i < deviceCount; i++)
         {
-            cuErrorExit(cuDeviceGet(&hcuDevice, iDevice));
-            cuErrorExit(cuCtxCreate(&cuContext[iDevice], 0, hcuDevice));
+            cuErrorExit(cuDeviceGet(&subContext[i].dev, i));
+            // cuErrorExit(cuCtxCreate(&subContext[i].context, 0, subContext[i].dev));
+            cuErrorExit(cuDevicePrimaryCtxRetain(&subContext[i].context, subContext[i].dev));
+            subContext[i].moduleCount = 0;
+            memset(subContext[i].modules, 0, sizeof(subContext[i].modules));
         }
-
-        CudaModule subModules[CudaModuleMaxNum];
-        // int subFunctionNum  = 0;
-        // int subVariableNum  = 0;
-        int subModuleNum    = 0;
+        cuErrorExit(cuCtxSetCurrent(subContext[CUR_DEVICE].context));
+        MODULE_LOAD_MAP |= 1<<DEFAULT_DEVICE;
         while (1) {
             while(read(pfd[tid][READ], &cmd, 4) == 0);
             if(cmd==0)
@@ -2305,67 +2346,142 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                 case VIRTIO_CUDA_REGISTERFATBINARY: {
                     err = cudaSuccess;
                     int size = 0;
+                    CudaContext *ctx = &subContext[DEFAULT_DEVICE];
+                    subModuleNum = ctx->moduleCount;
                     read(pfd[tid][READ], &size, 4);
-                    subModules[subModuleNum].fatbin_size = size;
+                    ctx->modules[subModuleNum].fatbin_size = size;
                     void *fatbin = malloc(size);
-                    subModules[subModuleNum].fatbin = fatbin;
+                    ctx->modules[subModuleNum].fatbin = fatbin;
                     read(pfd[tid][READ], fatbin, size);
-                    cuErrorExit(cuModuleLoadData(&subModules[subModuleNum].module, fatbin));
+                    read(pfd[tid][READ], &ctx->modules[subModuleNum].handle, sizeof(size_t));
+                    cuErrorExit(cuModuleLoadData(&ctx->modules[subModuleNum].module, fatbin));
                     write(cfd[tid][WRITE], &err, sizeof(cudaError_t));
-                    write(cfd[tid][WRITE], &subModules[subModuleNum].module, sizeof(CUmodule));
-                    subModuleNum++;
+                    ctx->moduleCount++;
                     break;
                 }
                 case VIRTIO_CUDA_UNREGISTERFATBINARY: {
                     err = cudaSuccess;
-                    for (i=0; i < subModuleNum; i++) {
-                        free(subModules[i].fatbin);
-                        cuErrorExit(cuModuleUnload(subModules[i].module));
+                    CudaContext *ctx = NULL;
+                    CudaModule *mod = NULL;
+                    for (int dev=0; dev<CudaContextMaxNum; dev++) {
+                        if (MODULE_LOAD_MAP & 1<<dev) {
+                            ctx = &subContext[dev];
+                            for (i=0; i < ctx->moduleCount; i++) {
+                                mod = &ctx->modules[i];
+                                for(int j=0; j<mod->cudaKernelsCount; j++) {
+                                    free(mod->cudaKernels[j].func_name);
+                                }
+                                for(int j=0; j<mod->globalMemCount; j++) {
+                                    free(mod->globalMem[j].addr_name);
+                                }
+                                cuErrorExit(cuModuleUnload(mod->module));
+                                free(mod->fatbin);
+                                memset(mod, 0, sizeof(CudaModule));
+                            }
+                            ctx->moduleCount=0;
+                        }
                     }
-                    subModuleNum = 0;
+                    MODULE_LOAD_MAP = 0x00;
                     write(cfd[tid][WRITE], &err, sizeof(cudaError_t));
                     break;
                 }
-                case VIRTIO_CUDA_SETDEVICE: {
-                    int dev = 0;
-                    read(pfd[tid][READ], &dev, 4);
-                    cudaCheck(cudaSetDevice(dev), cfd[tid][WRITE]);
-                    break;
-                }
-                case VIRTIO_CUDA_SETDEVICEFLAGS: {
-                    unsigned int flags;
-                    read(pfd[tid][READ], &flags, sizeof(unsigned int));
-                    cudaCheck(cudaSetDeviceFlags(flags), cfd[tid][WRITE]);
-                    break;
-                }
-                case VIRTIO_CUDA_DEVICERESET: {
-                    cudaCheck(cudaDeviceReset(), cfd[tid][WRITE]);
-                    break;
-                }
                 case VIRTIO_CUDA_REGISTERFUNCTION: {
-                    read(pfd[tid][READ], &data_len, 4);
-                    void *name = malloc(data_len);
-                    read(pfd[tid][READ], name, data_len);
-                    read(pfd[tid][READ], &module, sizeof(CUmodule));
-                    cuCheck(cuModuleGetFunction(&kernel_func, module, name),
+                    size_t handle;
+                    CudaContext *ctx = &subContext[DEFAULT_DEVICE];
+                    subModuleNum = ctx->moduleCount;
+                    read(pfd[tid][READ], &handle, sizeof(size_t));
+                    CudaModule *cuda_module = NULL;
+                    for(i=0; i<subModuleNum; i++) {
+                        if(ctx->modules[i].handle == handle) {
+                            cuda_module=&ctx->modules[i];
+                            break;
+                        }
+                    }
+                    if (!cuda_module) {
+                        err = cudaErrorInvalidValue;
+                        write(cfd[tid][WRITE], &err, sizeof(cudaError_t));
+                        exit(EXIT_FAILURE);
+                    }
+                    CudaKernel *kernel = &cuda_module->cudaKernels[cuda_module->cudaKernelsCount++];
+                    read(pfd[tid][READ], &kernel->func_name_size, 4);
+                    kernel->func_name = malloc(kernel->func_name_size);
+                    read(pfd[tid][READ], kernel->func_name, kernel->func_name_size);
+                    read(pfd[tid][READ], &kernel->func_id, sizeof(size_t));
+                    cuCheck(cuModuleGetFunction(&kernel->kernel_func, cuda_module->module, kernel->func_name),
                             cfd[tid][WRITE]);
-                    write(cfd[tid][WRITE], &kernel_func, sizeof(CUfunction));
-                    free(name);
                     break;
                 }
                 case VIRTIO_CUDA_REGISTERVAR : {
                     // cuError( cuModuleGetGlobal(
                     //     &dptr, &bytes, module, name) );
-                    size_t count = 0;
-                    read(pfd[tid][READ], &data_len, 4);
-                    void *name = malloc(data_len);
-                    read(pfd[tid][READ], name, data_len);
-                    read(pfd[tid][READ], &module, sizeof(CUmodule));
-                    cuCheck(cuModuleGetGlobal(&dptr, &count, module, name),
+                    size_t handle;
+                    CudaContext *ctx = &subContext[DEFAULT_DEVICE];
+                    subModuleNum = ctx->moduleCount;
+                    read(pfd[tid][READ], &handle, sizeof(size_t));
+                    CudaModule *cuda_module = NULL;
+                    for(i=0; i<subModuleNum; i++) {
+                        if(ctx->modules[i].handle == handle) {
+                            cuda_module=&ctx->modules[i];
+                            break;
+                        }
+                    }
+                    if (!cuda_module) {
+                        err = cudaErrorInvalidValue;
+                        write(cfd[tid][WRITE], &err, sizeof(cudaError_t));
+                        exit(EXIT_FAILURE);
+                    }
+                    CudaGlobalMem *var = &cuda_module->globalMem[cuda_module->globalMemCount++];
+                    read(pfd[tid][READ], &var->addr_name_size, 4);
+                    var->addr_name = malloc(var->addr_name_size);
+                    read(pfd[tid][READ], var->addr_name, var->addr_name_size);
+                    read(pfd[tid][READ], &var->host_var, sizeof(size_t));
+                    cuCheck(cuModuleGetGlobal(&var->device_ptr, &var->mem_size, cuda_module->module, var->addr_name),
                             cfd[tid][WRITE]);
-                    write(cfd[tid][WRITE], &dptr, sizeof(CUdeviceptr));
-                    write(cfd[tid][WRITE], &count, sizeof(size_t));
-                    free(name);
+                    break;
+                }
+                case VIRTIO_CUDA_SETDEVICE: {
+                    int dev = 0;
+                    read(pfd[tid][READ], &dev, 4);
+                    if (!(MODULE_LOAD_MAP & 1<<dev)) {
+                        CUR_DEVICE = dev;
+                        cudaCheck(cudaSetDevice(dev), cfd[tid][WRITE]);
+                        cuErrorExit(cuCtxSetCurrent(subContext[dev].context));
+                        MODULE_LOAD_MAP |= 1<<dev;
+                        init_device_module(&subContext[dev]);
+                    } else {
+                        err = cudaSuccess;
+                        write(cfd[tid][WRITE], &err, sizeof(cudaError_t));
+                    }
+                    break;
+                }
+                case VIRTIO_CUDA_SETDEVICEFLAGS: {
+                    unsigned int flags;
+                    CUcontext context=0;
+                    read(pfd[tid][READ], &flags, sizeof(unsigned int));
+                    cuErrorExit(cuCtxGetCurrent(&context));
+                    if (context != subContext[CUR_DEVICE].context) {
+                        error("current context does not match!\n");
+                        err = cudaErrorInvalidDevice;
+                        write(cfd[tid][WRITE], &err, sizeof(cudaError_t));
+                        break;
+                    }
+                    err = cudaSetDeviceFlags(flags);
+                    if (err == cudaErrorSetOnActiveProcess) 
+                        err = cudaSuccess;
+                    write(cfd[tid][WRITE], &err, sizeof(cudaError_t));
+                    break;
+                }
+                case VIRTIO_CUDA_DEVICERESET: {
+                    CudaContext *ctx = &subContext[CUR_DEVICE];
+                    cuErrorExit(cuDevicePrimaryCtxReset(ctx->dev));
+                    cuErrorExit(cuDevicePrimaryCtxRetain(&ctx->context, ctx->dev));
+                    cuErrorExit(cuCtxSetCurrent(ctx->context));
+                    init_device_module(ctx);
+                    // cuErrorExit(cuCtxDestroy(ctx->context));
+                    // cudaCheck(cudaDeviceReset(), cfd[tid][WRITE]);
+                    // cuErrorExit(cuCtxCreate(&ctx->context, 0, ctx->dev));
+                    err = cudaSuccess;
+                    write(cfd[tid][WRITE], &err, sizeof(cudaError_t));
                     break;
                 }
                 case VIRTIO_CUDA_MALLOC: {
@@ -2483,7 +2599,8 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                     break;
                 }
                 case VIRTIO_CUDA_LAUNCH: {
-                    read(pfd[tid][READ], &kernel_func, sizeof(CUfunction));
+                    size_t handle;
+                    read(pfd[tid][READ], &handle, sizeof(size_t));
                     read(pfd[tid][READ], &gridDim, sizeof(dim3));
                     read(pfd[tid][READ], &blockDim, sizeof(dim3));
                     read(pfd[tid][READ], &sharedMem, sizeof(size_t));
@@ -2492,19 +2609,42 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                     uint8_t *para=malloc(data_len);
                     read(pfd[tid][READ], para, data_len);
 
+                    CudaModule *cuda_module = NULL;
+                    CudaKernel *kernel = NULL;
+                    CudaContext *ctx = &subContext[CUR_DEVICE];
+                    subModuleNum = ctx->moduleCount;
+                    for(i=0; i<subModuleNum; i++) {
+                        cuda_module = &ctx->modules[i];
+                        for(int j=0; j<cuda_module->cudaKernelsCount; j++) {
+                            if (cuda_module->cudaKernels[j].func_id == handle) {
+                                kernel = &cuda_module->cudaKernels[j];
+                                break;
+                            }
+                        }
+                    }
+                    if (!kernel) {
+                        err = cudaErrorInvalidValue;
+                        write(cfd[tid][WRITE], &err, sizeof(cudaError_t));
+                        break;
+                    }
                     uint32_t para_num = *((uint32_t*)para);
                     debug(" para_num = %u\n", para_num);
                     void **para_buf = malloc(para_num * sizeof(void*));
                     int para_idx = sizeof(uint32_t);
                     for(i=0; i<para_num; i++) {
                         para_buf[i] = &para[para_idx + sizeof(uint32_t)];
-                        debug("arg %d = 0x%llx , size=%u byte\n", i, 
+                        if (*(uint32_t*)(&para[para_idx]) == 4)
+                            debug("arg %d = 0x%x , size=%u byte\n", i, 
+                              *(unsigned int*)para_buf[i], 
+                              *(unsigned int*)(&para[para_idx]));
+                        else 
+                            debug("arg %d = 0x%llx , size=%u byte\n", i, 
                               *(unsigned long long*)para_buf[i], 
                               *(unsigned int*)(&para[para_idx]));
                         para_idx += *(uint32_t*)(&para[para_idx]) + sizeof(uint32_t);
                     }
 
-                    cuCheck(cuLaunchKernel( kernel_func,
+                    cuCheck(cuLaunchKernel( kernel->kernel_func,
                                             gridDim.x, gridDim.y, gridDim.z,
                                             blockDim.x, blockDim.y, blockDim.z,
                                             sharedMem,
@@ -2613,23 +2753,61 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                 case VIRTIO_CUDA_MEMCPYTOSYMBOL: {
                     size_t count    = 0;
                     size_t offset   = 0;
+                    size_t handle;
                     read(pfd[tid][READ], &count, sizeof(size_t));
                     void *src = malloc(count);
                     read(pfd[tid][READ], src, count);
-                    read(pfd[tid][READ], &dptr, sizeof(CUdeviceptr));
+                    read(pfd[tid][READ], &handle, sizeof(size_t));
                     read(pfd[tid][READ], &offset, sizeof(size_t));
-                    cuCheck(cuMemcpyHtoD(dptr+offset, src, count), cfd[tid][WRITE]);
+                    CudaModule *cuda_module = NULL;
+                    CudaGlobalMem *var = NULL;
+                    CudaContext *ctx = &subContext[CUR_DEVICE];
+                    subModuleNum = ctx->moduleCount;
+                    for(i=0; i<subModuleNum; i++) {
+                        cuda_module = &ctx->modules[i];
+                        for(int j=0; j<cuda_module->globalMemCount; j++) {
+                            if (cuda_module->globalMem[j].host_var == handle) {
+                                var = &cuda_module->globalMem[j];
+                                break;
+                            }
+                        }
+                    }
+                    if (!var) {
+                        err = cudaErrorInvalidValue;
+                        write(cfd[tid][WRITE], &err, sizeof(cudaError_t));
+                        break;
+                    }
+                    cuCheck(cuMemcpyHtoD(var->device_ptr+offset, src, count), cfd[tid][WRITE]);
                     free(src);
                     break;
                 }
                 case VIRTIO_CUDA_MEMCPYFROMSYMBOL : {
                     size_t count    = 0;
                     size_t offset   = 0;
+                    size_t handle;
                     read(pfd[tid][READ], &count, sizeof(size_t));
-                    read(pfd[tid][READ], &dptr, sizeof(CUdeviceptr));
+                    read(pfd[tid][READ], &handle, sizeof(size_t));
                     read(pfd[tid][READ], &offset, sizeof(size_t));
                     void *dst = malloc(count);
-                    cuCheck(cuMemcpyDtoH(dst, dptr+offset, count), cfd[tid][WRITE]);
+                    CudaModule *cuda_module = NULL;
+                    CudaGlobalMem *var = NULL;
+                    CudaContext *ctx = &subContext[CUR_DEVICE];
+                    subModuleNum = ctx->moduleCount;
+                    for(i=0; i<subModuleNum; i++) {
+                        cuda_module = &ctx->modules[i];
+                        for(int j=0; j<cuda_module->globalMemCount; j++) {
+                            if (cuda_module->globalMem[j].host_var == handle) {
+                                var = &cuda_module->globalMem[j];
+                                break;
+                            }
+                        }
+                    }
+                    if (!var) {
+                        err = cudaErrorInvalidValue;
+                        write(cfd[tid][WRITE], &err, sizeof(cudaError_t));
+                        break;
+                    }
+                    cuCheck(cuMemcpyDtoH(dst, var->device_ptr+offset, count), cfd[tid][WRITE]);
                     write(cfd[tid][WRITE], dst, count);
                     free(dst);
                     break;
@@ -2638,10 +2816,12 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                     error("No such cmd %d\n", cmd);
             }
         }
-        for (int iDevice = 0; iDevice < deviceCount; iDevice++)
+        for (i = 0; i < deviceCount; i++)
         {
-            cuErrorExit(cuCtxDestroy(cuContext[iDevice]));
+            cuErrorExit(cuDevicePrimaryCtxRelease(subContext[i].dev));
         }
+        free(subContext);
+        subContext = NULL;
         debug("child process finish\n");
         exit(EXIT_SUCCESS);
     }
