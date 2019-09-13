@@ -70,8 +70,8 @@
 #endif
 
 /* bitmap */
-typedef uint32_t word_t;
-enum{BITS_PER_WORD = sizeof(word_t) * CHAR_BIT}; // BITS_PER_WORD=32
+typedef long long unsigned int word_t;
+enum{BITS_PER_WORD = sizeof(word_t) * CHAR_BIT}; // BITS_PER_WORD=64
 #define WORD_OFFSET(b) ((b)/BITS_PER_WORD)
 #define BIT_OFFSET(b) ((b)%BITS_PER_WORD)
 
@@ -93,7 +93,8 @@ typedef struct VirtConsole {
 #define CudaFunctionMaxNum  32
 #define CudaVariableMaxNum  32
 
-#define CudaEventMaxNum BITS_PER_WORD
+#define CudaEventMapMax 4
+#define CudaEventMaxNum BITS_PER_WORD * CudaEventMapMax
 #define CudaStreamMaxNum BITS_PER_WORD
 #define VOL_OFFSET 0x1000
 
@@ -179,7 +180,7 @@ static CudaDev cudaDevices[WORKER_THREADS];
 static int cudaModuleNum[WORKER_THREADS];
 
 static cudaEvent_t cudaEvent[WORKER_THREADS][CudaEventMaxNum];
-static word_t cudaEventBitmap[WORKER_THREADS];
+static word_t cudaEventBitmap[WORKER_THREADS][CudaEventMapMax];
 static cudaStream_t cudaStream[WORKER_THREADS][CudaStreamMaxNum];
 static word_t cudaStreamBitmap[WORKER_THREADS];
 
@@ -533,10 +534,11 @@ static void cuda_unregister_fatbinary(VirtIOArg *arg, int tid)
         list_del(&vol->list);
     }
     // free stream
-    cudaStreamBitmap[tid]   = 0xffffffff;
+    memset(&cudaStreamBitmap[tid], ~0, sizeof(cudaStreamBitmap[tid]));
     memset(cudaStream[tid], 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
 
-    cudaEventBitmap[tid]    = 0xffffffff;
+    memset(cudaEventBitmap[tid], ~0, sizeof(cudaEventBitmap[tid]));
+
     memset(cudaEvent[tid], 0, sizeof(cudaEvent_t)*CudaEventMaxNum);
     
     int cmd =VIRTIO_CUDA_UNREGISTERFATBINARY;
@@ -1737,8 +1739,7 @@ static void cuda_device_reset(VirtIOArg *arg, int tid)
             cudaError( cudaStreamDestroy(cudaStream[tid][pos-1]) );
         }
     }*/
-    // cudaStreamBitmap[tid] = 0xfffffffe;
-    cudaStreamBitmap[tid] = 0xffffffff;
+    memset(&cudaStreamBitmap[tid], ~0, sizeof(cudaStreamBitmap[tid]));
     memset(cudaStream[tid], 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
     // free event
     /*for(int pos = 1; pos <= BITS_PER_WORD; pos++) {
@@ -1746,7 +1747,7 @@ static void cuda_device_reset(VirtIOArg *arg, int tid)
             cudaError( cudaEventDestroy(cudaEvent[tid][pos-1]) );
         }
     }*/
-    cudaEventBitmap[tid] = 0xffffffff;
+    memset(cudaEventBitmap[tid], ~0, sizeof(cudaEventBitmap[tid]));
     memset(cudaEvent[tid], 0, sizeof(cudaEvent_t)*CudaEventMaxNum);
     int cmd = VIRTIO_CUDA_DEVICERESET;
     write(pfd[tid][WRITE], &cmd, 4);
@@ -1763,7 +1764,7 @@ static void cuda_stream_create(VirtIOArg *arg, int tid)
     cudaError_t err = -1;
     uint32_t pos = 0;
     func();
-    pos = ffs(cudaStreamBitmap[tid]);
+    pos = ffsll(cudaStreamBitmap[tid]);
     if (!pos) {
         error("stream number is up to %d\n", CudaStreamMaxNum);
         return;
@@ -1826,7 +1827,7 @@ static void cuda_stream_wait_event(VirtIOArg *arg, int tid)
     stream = cudaStream[tid][pos-1];
     debug("destroy stream 0x%lx\n", (uint64_t)stream);
     pos = arg->dst;
-    if (__get_bit(&cudaEventBitmap[tid], pos-1)) {
+    if (__get_bit(cudaEventBitmap[tid], pos-1)) {
         error("No such event, pos=%ld\n", pos);
         arg->cmd=cudaErrorInvalidValue;
         return;
@@ -1850,7 +1851,10 @@ static void cuda_event_create(VirtIOArg *arg, int tid)
     cudaError_t err = -1;
     uint32_t pos = 0;
     func();
-    pos = ffs(cudaEventBitmap[tid]);
+    for(int i=0; i<CudaEventMapMax; i++) {    
+        pos = ffsll(cudaEventBitmap[tid][i]);
+        if(pos) break;
+    }
     if(!pos) {
         error("event number is up to %d\n", CudaEventMaxNum);
         return;
@@ -1865,7 +1869,7 @@ static void cuda_event_create(VirtIOArg *arg, int tid)
     }
     read(cfd[tid][READ], &cudaEvent[tid][pos-1], sizeof(cudaEvent_t));
     arg->flag = (uint64_t)pos;
-    __clear_bit(&cudaEventBitmap[tid], pos-1);
+    __clear_bit(cudaEventBitmap[tid], pos-1);
     debug("create event 0x%lx, idx is %u\n",
           (uint64_t)cudaEvent[tid][pos-1], pos-1);
 }
@@ -1876,7 +1880,10 @@ static void cuda_event_create_with_flags(VirtIOArg *arg, int tid)
     uint32_t pos = 0;
     unsigned int flag=0;
     func();
-    pos = ffs(cudaEventBitmap[tid]);
+    for(int i=0; i<CudaEventMapMax; i++) {
+        pos = ffsll(cudaEventBitmap[tid][i]);
+        if(pos) break;
+    }
     if(!pos) {
         error("event number is up to %d\n", CudaEventMaxNum);
         return;
@@ -1894,7 +1901,7 @@ static void cuda_event_create_with_flags(VirtIOArg *arg, int tid)
     }
     read(cfd[tid][READ], &cudaEvent[tid][pos-1], sizeof(cudaEvent_t));
     arg->dst = (uint64_t)pos;
-    __clear_bit(&cudaEventBitmap[tid], pos-1);
+    __clear_bit(cudaEventBitmap[tid], pos-1);
     debug("create event 0x%lx with flag %u, idx is %u\n",
           (uint64_t)cudaEvent[tid][pos-1], flag, pos-1);
 }
@@ -1905,7 +1912,7 @@ static void cuda_event_destroy(VirtIOArg *arg, int tid)
     uint32_t pos = 0;
     func();
     pos = arg->flag;
-    if (__get_bit(&cudaEventBitmap[tid], pos-1)) {
+    if (__get_bit(cudaEventBitmap[tid], pos-1)) {
         error("No such event, pos=%d\n", pos);
         arg->cmd=cudaErrorInvalidValue;
         return;
@@ -1921,7 +1928,7 @@ static void cuda_event_destroy(VirtIOArg *arg, int tid)
         error("destroy event error.\n");
         return;
     }
-    __set_bit(&cudaEventBitmap[tid], pos-1);
+    __set_bit(cudaEventBitmap[tid], pos-1);
 }
 
 static void cuda_event_record(VirtIOArg *arg, int tid)
@@ -1933,7 +1940,7 @@ static void cuda_event_record(VirtIOArg *arg, int tid)
     epos = arg->src;
     spos = arg->dst;
     debug("event pos = 0x%lx\n", epos);
-    if (epos<=0 || __get_bit(&cudaEventBitmap[tid], epos-1)) {
+    if (epos<=0 || __get_bit(cudaEventBitmap[tid], epos-1)) {
         error("No such event, pos=0x%lx\n", epos);
         arg->cmd=cudaErrorInvalidResourceHandle;
         return;
@@ -1970,7 +1977,7 @@ static void cuda_event_synchronize(VirtIOArg *arg, int tid)
     uint32_t pos = 0;
     func();
     pos = arg->flag;
-    if (__get_bit(&cudaEventBitmap[tid], pos-1)) {
+    if (__get_bit(cudaEventBitmap[tid], pos-1)) {
         error("No such event, pos=%d\n", pos);
         arg->cmd=cudaErrorInvalidValue;
         return;
@@ -1996,12 +2003,12 @@ static void cuda_event_elapsedtime(VirtIOArg *arg, int tid)
     func();
     start_pos = arg->src;
     stop_pos = arg->dst;
-    if (__get_bit(&cudaEventBitmap[tid], start_pos-1)) {
+    if (__get_bit(cudaEventBitmap[tid], start_pos-1)) {
         error("No such event, pos=%d\n", start_pos);
         arg->cmd=cudaErrorInvalidValue;
         return;
     }
-    if (__get_bit(&cudaEventBitmap[tid], stop_pos-1)) {
+    if (__get_bit(cudaEventBitmap[tid], stop_pos-1)) {
         error("No such event, pos=%d\n", stop_pos);
         arg->cmd=cudaErrorInvalidValue;
         return;
@@ -2327,8 +2334,8 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
     pipe(cfd[tid]);
     cudaDevices[tid].device = (port_id-1)%total_device;
         /*reserved index 0 for thread*/
-    cudaStreamBitmap[tid] = 0xffffffff;
-    cudaEventBitmap[tid] = 0xffffffff;
+    memset(&cudaStreamBitmap[tid], ~0, sizeof(cudaStreamBitmap[tid]));
+    memset(cudaEventBitmap[tid], ~0, sizeof(cudaEventBitmap[tid]));
     memset(cudaEvent[tid], 0, sizeof(cudaEvent_t)*CudaEventMaxNum);
     memset(cudaStream[tid], 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
     cudaModuleNum[tid]=0;
