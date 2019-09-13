@@ -861,7 +861,7 @@ static void virtio_cuda_device_realize(DeviceState *dev, Error **errp)
     pipe(cfd);
     pid_t cpid = fork();
     if(cpid == 0) {
-        printf("child pid=%d\n", getpid());
+        // printf("child pid=%d\n", getpid());
         // printf("child's parent ppid=%d\n", getppid());
         close(pfd[1]);
         close(cfd[0]);
@@ -910,7 +910,7 @@ static void virtio_cuda_device_realize(DeviceState *dev, Error **errp)
                     printf("No such cmd %d\n", cmd);
             }
         }
-        printf("child process finish\n");
+        // printf("child process finish\n");
         exit(EXIT_SUCCESS);
     }
     close(pfd[0]);

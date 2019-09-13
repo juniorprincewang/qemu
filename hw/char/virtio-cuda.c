@@ -478,6 +478,7 @@ static void cuda_register_fatbinary(VirtIOArg *arg, int tid)
 
     debug("fat_bin gpa is 0x%lx\n", *(uint64_t*)fat_bin);
     debug("fat_bin gva is 0x%lx\n", (uint64_t)arg->src);
+    debug("fat_bin size is 0x%x\n", fatbin_size);
     cudaModules[tid][m_num].handle      = handle;
     cudaModules[tid][m_num].fatbin_size = fatbin_size;
     cudaModules[tid][m_num].cudaKernelsCount = 0;
@@ -496,12 +497,11 @@ static void cuda_register_fatbinary(VirtIOArg *arg, int tid)
     write(pfd[tid][WRITE], &fatbin_size, 4);
     write(pfd[tid][WRITE], fat_bin, fatbin_size);
     write(pfd[tid][WRITE], &handle, sizeof(size_t));
-    while(read(cfd[tid][READ], &err, sizeof(cudaError_t))==0);
+    read(cfd[tid][READ], &err, sizeof(cudaError_t));
     if (err != cudaSuccess) {
         error("Failed to register fatbinary!\n");
     }
     arg->cmd = err;
-    // read(cfd[tid][READ], &cudaModules[tid][m_num].module, sizeof(CUmodule));
     cudaModuleNum[tid]++;  
 }
 
@@ -556,7 +556,7 @@ static void cuda_register_function(VirtIOArg *arg, int tid)
     hwaddr func_name_gpa;
     size_t func_id;
     int name_size;
-    int fatbin_size;
+    unsigned int fatbin_size;
     int m_num   = cudaModuleNum[tid];
     int m_idx   = -1;
     int i       = 0;
@@ -619,8 +619,6 @@ static void cuda_register_function(VirtIOArg *arg, int tid)
         arg->cmd = err;
         return;
     }
-    // read(cfd[tid][READ], &kernel->kernel_func, sizeof(CUfunction));
-    // debug("kernel_func=0x%lx\n", (uint64_t)kernel->kernel_func);
     arg->cmd = cudaSuccess;
 }
 
@@ -2377,19 +2375,23 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
         for (i = 0; i < deviceCount; i++)
         {
             cuErrorExit(cuDeviceGet(&subContext[i].dev, i));
-            // cuErrorExit(cuCtxCreate(&subContext[i].context, 0, subContext[i].dev));
-            cuErrorExit(cuDevicePrimaryCtxRetain(&subContext[i].context, subContext[i].dev));
-            subContext[i].moduleCount = 0;
-            memset(subContext[i].modules, 0, sizeof(subContext[i].modules));
         }
-        cuErrorExit(cuCtxSetCurrent(subContext[CUR_DEVICE].context));
-        MODULE_LOAD_MAP |= 1<<DEFAULT_DEVICE;
         while (1) {
             while(read(pfd[tid][READ], &cmd, 4) == 0);
             if(cmd==0)
                 break;
             switch(cmd) {
                 case VIRTIO_CUDA_REGISTERFATBINARY: {
+                    if (! (MODULE_LOAD_MAP & 1<<DEFAULT_DEVICE)) {
+                        debug("Initialize DEFAULT_DEVICE\n");
+                        MODULE_LOAD_MAP |= 1<<DEFAULT_DEVICE;
+                        cuErrorExit(cuDevicePrimaryCtxRetain(&subContext[DEFAULT_DEVICE].context, 
+                                                            subContext[DEFAULT_DEVICE].dev));
+                        subContext[DEFAULT_DEVICE].moduleCount = 0;
+                        memset(subContext[DEFAULT_DEVICE].modules, 0, sizeof(subContext[DEFAULT_DEVICE].modules));
+                        cuErrorExit(cuCtxSetCurrent(subContext[DEFAULT_DEVICE].context));
+                    }
+
                     err = cudaSuccess;
                     int size = 0;
                     CudaContext *ctx = &subContext[DEFAULT_DEVICE];
@@ -2413,6 +2415,7 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                         if (MODULE_LOAD_MAP & 1<<dev) {
                             ctx = &subContext[dev];
                             for (i=0; i < ctx->moduleCount; i++) {
+                                debug("Unload module\n");
                                 mod = &ctx->modules[i];
                                 for(int j=0; j<mod->cudaKernelsCount; j++) {
                                     free(mod->cudaKernels[j].func_name);
@@ -2425,6 +2428,7 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                                 memset(mod, 0, sizeof(CudaModule));
                             }
                             ctx->moduleCount=0;
+                            cuErrorExit(cuDevicePrimaryCtxRelease(ctx->dev));
                         }
                     }
                     MODULE_LOAD_MAP = 0x00;
@@ -2490,8 +2494,10 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                     read(pfd[tid][READ], &dev, 4);
                     if (!(MODULE_LOAD_MAP & 1<<dev)) {
                         CUR_DEVICE = dev;
-                        cudaCheck(cudaSetDevice(dev), cfd[tid][WRITE]);
+                        cuErrorExit(cuDevicePrimaryCtxRetain(&subContext[dev].context, 
+                                                            subContext[dev].dev));
                         cuErrorExit(cuCtxSetCurrent(subContext[dev].context));
+                        // cudaCheck(cudaSetDevice(dev), cfd[tid][WRITE]);
                         MODULE_LOAD_MAP |= 1<<dev;
                         init_device_module(&subContext[dev]);
                     } else {
@@ -2523,9 +2529,6 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                     cuErrorExit(cuDevicePrimaryCtxRetain(&ctx->context, ctx->dev));
                     cuErrorExit(cuCtxSetCurrent(ctx->context));
                     init_device_module(ctx);
-                    // cuErrorExit(cuCtxDestroy(ctx->context));
-                    // cudaCheck(cudaDeviceReset(), cfd[tid][WRITE]);
-                    // cuErrorExit(cuCtxCreate(&ctx->context, 0, ctx->dev));
                     err = cudaSuccess;
                     write(cfd[tid][WRITE], &err, sizeof(cudaError_t));
                     break;
@@ -2679,14 +2682,16 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                     int para_idx = sizeof(uint32_t);
                     for(i=0; i<para_num; i++) {
                         para_buf[i] = &para[para_idx + sizeof(uint32_t)];
-                        if (*(uint32_t*)(&para[para_idx]) == 4)
+                        if (*(uint32_t*)(&para[para_idx]) == 4) {
                             debug("arg %d = 0x%x , size=%u byte\n", i, 
                               *(unsigned int*)para_buf[i], 
                               *(unsigned int*)(&para[para_idx]));
-                        else 
+                        }
+                        else  {
                             debug("arg %d = 0x%llx , size=%u byte\n", i, 
                               *(unsigned long long*)para_buf[i], 
                               *(unsigned int*)(&para[para_idx]));
+                        }
                         para_idx += *(uint32_t*)(&para[para_idx]) + sizeof(uint32_t);
                     }
 
@@ -2867,10 +2872,6 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                 default:
                     error("No such cmd %d\n", cmd);
             }
-        }
-        for (i = 0; i < deviceCount; i++)
-        {
-            cuErrorExit(cuDevicePrimaryCtxRelease(subContext[i].dev));
         }
         free(subContext);
         subContext = NULL;
