@@ -1675,18 +1675,18 @@ static void cuda_set_device(VirtIOArg *arg, int tid)
         return ;
     }
     
+    debug("set devices=%d\n", (int)(arg->flag));
     cudaDevices[tid].device = (CUdevice)dev_id;
 
     int cmd = VIRTIO_CUDA_SETDEVICE;
     write(pfd[tid][WRITE], &cmd, 4);
     write(pfd[tid][WRITE], &dev_id, 4);
-    while(read(cfd[tid][READ], &err, sizeof(cudaError_t))==0);
+    read(cfd[tid][READ], &err, sizeof(cudaError_t));
     arg->cmd = err;
     if (err != cudaSuccess) {
         error("set device error.\n");
         return;
     }
-    debug("set devices=%d\n", (int)(arg->flag));
     /* clear kernel function addr in parent process, 
     because cudaSetDevice will clear all resources related with host thread.
     */
@@ -1800,13 +1800,37 @@ static void cuda_stream_destroy(VirtIOArg *arg, int tid)
     int cmd = VIRTIO_CUDA_STREAMDESTROY;
     write(pfd[tid][WRITE], &cmd, 4);
     write(pfd[tid][WRITE], &cudaStream[tid][pos-1], sizeof(cudaStream_t));
-    while(read(cfd[tid][READ], &err, sizeof(cudaError_t))==0);
+    read(cfd[tid][READ], &err, sizeof(cudaError_t));
     arg->cmd = err;
     if (err != cudaSuccess) {
         error("destroy stream error.\n");
         return;
     }
     __set_bit(&cudaStreamBitmap[tid], pos-1);
+}
+
+static void cuda_stream_synchronize(VirtIOArg *arg, int tid)
+{
+    cudaError_t err = -1;
+    uint32_t pos;
+    func();
+    pos = arg->flag;
+    if (__get_bit(&cudaStreamBitmap[tid], pos-1)) {
+        error("No such stream, pos=%d\n", pos);
+        arg->cmd=cudaErrorInvalidResourceHandle;
+        return;
+    }
+    debug("destroy stream 0x%lx\n", (uint64_t)cudaStream[tid][pos-1]);
+    // cudaError( (err=cudaStreamSynchronize(cudaStream[tid][pos-1]) ));
+    int cmd = VIRTIO_CUDA_STREAMSYNCHRONIZE;
+    write(pfd[tid][WRITE], &cmd, 4);
+    write(pfd[tid][WRITE], &cudaStream[tid][pos-1], sizeof(cudaStream_t));
+    read(cfd[tid][READ], &err, sizeof(cudaError_t));
+    arg->cmd = err;
+    if (err != cudaSuccess) {
+        error("synchronize stream error.\n");
+        return;
+    }
 }
 
 static void cuda_stream_wait_event(VirtIOArg *arg, int tid)
@@ -1823,7 +1847,7 @@ static void cuda_stream_wait_event(VirtIOArg *arg, int tid)
         return;
     }
     stream = cudaStream[tid][pos-1];
-    debug("destroy stream 0x%lx\n", (uint64_t)stream);
+    debug("stream 0x%lx\n", (uint64_t)stream);
     pos = arg->dst;
     if (__get_bit(cudaEventBitmap[tid], pos-1)) {
         error("No such event, pos=%ld\n", pos);
@@ -1831,7 +1855,7 @@ static void cuda_stream_wait_event(VirtIOArg *arg, int tid)
         return;
     }
     event = cudaEvent[tid][pos-1];
-    debug("destroy event 0x%lx\n", (uint64_t)event);
+    debug("wait for event 0x%lx\n", (uint64_t)event);
     
     int cmd = VIRTIO_CUDA_STREAMWAITEVENT;
     write(pfd[tid][WRITE], &cmd, 4);
@@ -2230,6 +2254,9 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
     case VIRTIO_CUDA_STREAMWAITEVENT:
         cuda_stream_wait_event(msg, tid);
         break;
+    case VIRTIO_CUDA_STREAMSYNCHRONIZE:
+        cuda_stream_synchronize(msg, tid);
+        break;
     default:
         error("[+] header.cmd=%u, nr= %u \n",
               msg->cmd, _IOC_NR(msg->cmd));
@@ -2500,10 +2527,9 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                         // cudaCheck(cudaSetDevice(dev), cfd[tid][WRITE]);
                         MODULE_LOAD_MAP |= 1<<dev;
                         init_device_module(&subContext[dev]);
-                    } else {
-                        err = cudaSuccess;
-                        write(cfd[tid][WRITE], &err, sizeof(cudaError_t));
                     }
+                    err = cudaSuccess;
+                    write(cfd[tid][WRITE], &err, sizeof(cudaError_t));
                     break;
                 }
                 case VIRTIO_CUDA_SETDEVICEFLAGS: {
@@ -2722,15 +2748,18 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                     break;
                 }
                 case VIRTIO_CUDA_STREAMCREATE: {
-                    cudaStream_t stream;
                     cudaCheck(cudaStreamCreate(&stream), cfd[tid][WRITE] );
                     write(cfd[tid][WRITE], &stream, sizeof(cudaStream_t));
                     break;
                 }
                 case VIRTIO_CUDA_STREAMDESTROY: {
-                    cudaStream_t stream;
                     read(pfd[tid][READ], &stream, sizeof(cudaStream_t));
                     cudaCheck(cudaStreamDestroy(stream), cfd[tid][WRITE]);
+                    break;
+                }
+                case VIRTIO_CUDA_STREAMSYNCHRONIZE: {
+                    read(pfd[tid][READ], &stream, sizeof(cudaStream_t));
+                    cudaCheck(cudaStreamSynchronize(stream), cfd[tid][WRITE]);
                     break;
                 }
                 case VIRTIO_CUDA_STREAMWAITEVENT: {
@@ -2740,13 +2769,11 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                     break;
                 }
                 case VIRTIO_CUDA_EVENTCREATE: {
-                    cudaEvent_t event;
                     cudaCheck(cudaEventCreate(&event), cfd[tid][WRITE]);
                     write(cfd[tid][WRITE], &event, sizeof(cudaEvent_t));
                     break;
                 }
                 case VIRTIO_CUDA_EVENTCREATEWITHFLAGS: {
-                    cudaEvent_t event;
                     unsigned int flags;
                     read(pfd[tid][READ], &flags, sizeof(unsigned int));
                     cudaCheck(cudaEventCreateWithFlags(&event, flags), cfd[tid][WRITE]);
@@ -2754,21 +2781,17 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
                     break;
                 }
                 case VIRTIO_CUDA_EVENTDESTROY: {
-                    cudaEvent_t event;
                     read(pfd[tid][READ], &event, sizeof(cudaEvent_t));
                     cudaCheck(cudaEventDestroy(event), cfd[tid][WRITE]);
                     break;
                 }
                 case VIRTIO_CUDA_EVENTRECORD: {
-                    cudaEvent_t event;
-                    cudaStream_t stream;
                     read(pfd[tid][READ], &event, sizeof(cudaEvent_t));
                     read(pfd[tid][READ], &stream, sizeof(cudaStream_t));
                     cudaCheck(cudaEventRecord(event, stream), cfd[tid][WRITE]);
                     break;
                 }
                 case VIRTIO_CUDA_EVENTSYNCHRONIZE: {
-                    cudaEvent_t event;
                     read(pfd[tid][READ], &event, sizeof(cudaEvent_t));
                     cudaCheck(cudaEventSynchronize(event), cfd[tid][WRITE]);
                     break;
