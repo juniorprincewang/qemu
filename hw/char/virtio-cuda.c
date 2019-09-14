@@ -25,8 +25,7 @@
 // #include <driver_types.h>   // cudaDeviceProp
 
 #include "virtio-ioc.h"
-// #include "message_queue.h"
-#include "memorypool.h"
+#include "chan.h"
 #include "list.h"
 
 #include <openssl/hmac.h> // hmac EVP_MAX_MD_SIZE
@@ -74,11 +73,6 @@ typedef long long unsigned int word_t;
 enum{BITS_PER_WORD = sizeof(word_t) * CHAR_BIT}; // BITS_PER_WORD=64
 #define WORD_OFFSET(b) ((b)/BITS_PER_WORD)
 #define BIT_OFFSET(b) ((b)%BITS_PER_WORD)
-
-
-static const mem_size_t max_mem = 2 * GB ;
-static const mem_size_t mem_pool_size = 1 * GB ;
-// static MemoryPool* mpool;
 
 typedef struct VirtConsole {
     VirtIOSerialPort parent_obj;
@@ -174,6 +168,9 @@ typedef struct CUDeviceContext
 static int total_device;   // total GPU device
 static int total_port;     // port count
 static QemuMutex total_port_mutex;
+
+static chan_t* worker_queue[WORKER_THREADS];
+static QemuThread worker_threads[WORKER_THREADS];
 
 static CudaModule cudaModules[WORKER_THREADS][CudaModuleMaxNum];
 static CudaDev cudaDevices[WORKER_THREADS];
@@ -2134,142 +2131,13 @@ static ssize_t flush_buf(VirtIOSerialPort *port,
                          const uint8_t *buf, ssize_t len)
 {
     int tid;
-    int ret;
-
     debug("port->id=%d, len=%ld\n", port->id, len);
     tid = port->id;// % total_port;
     if (len != sizeof(VirtIOArg)) {
         error("buf len should be %lu, not %ld\n", sizeof(VirtIOArg), len);
         return 0;
     }
-
-    VirtIOArg *msg = (VirtIOArg *)malloc(len);
-    memcpy((void *)msg, (void *)buf, len);
-
-    switch(msg->cmd) {
-        case VIRTIO_CUDA_HELLO:
-        cuda_gpa_to_hva(msg);
-        break;
-    case VIRTIO_CUDA_REGISTERFATBINARY:
-        cuda_register_fatbinary(msg, tid);
-        break;
-    case VIRTIO_CUDA_UNREGISTERFATBINARY:
-        cuda_unregister_fatbinary(msg, tid);
-        break;
-    case VIRTIO_CUDA_REGISTERFUNCTION:
-        cuda_register_function(msg, tid);
-        break;
-    case VIRTIO_CUDA_LAUNCH:
-        cuda_launch(msg, tid);
-        break;
-    case VIRTIO_CUDA_MALLOC:
-        cuda_malloc(msg, tid);
-        break;
-    case VIRTIO_CUDA_HOSTREGISTER:
-        cuda_host_register(msg, tid);
-        break;
-    case VIRTIO_CUDA_HOSTUNREGISTER:
-        cuda_host_unregister(msg, tid);
-        break;
-    case VIRTIO_CUDA_MEMCPY:
-        cuda_memcpy(msg, tid);
-        break;
-    case VIRTIO_CUDA_FREE:
-        cuda_free(msg, tid);
-        break;
-    case VIRTIO_CUDA_GETDEVICE:
-        cuda_get_device(msg, tid);
-        break;
-    case VIRTIO_CUDA_GETDEVICEPROPERTIES:
-        cuda_get_device_properties(msg);
-        break;
-    case VIRTIO_CUDA_CONFIGURECALL:
-        break;
-    case VIRTIO_CUDA_SETUPARGUMENT:
-        cuda_setup_argument(msg);
-        break;
-    case VIRTIO_CUDA_GETDEVICECOUNT:
-        cuda_get_device_count(msg);
-        break;
-    case VIRTIO_CUDA_SETDEVICE:
-        cuda_set_device(msg, tid);
-        break;
-    case VIRTIO_CUDA_SETDEVICEFLAGS:
-        cuda_set_device_flags(msg, tid);
-        break;
-    case VIRTIO_CUDA_DEVICERESET:
-        cuda_device_reset(msg, tid);
-        break;
-    case VIRTIO_CUDA_STREAMCREATE:
-        cuda_stream_create(msg, tid);
-        break;
-    case VIRTIO_CUDA_STREAMDESTROY:
-        cuda_stream_destroy(msg, tid);
-        break;
-    case VIRTIO_CUDA_EVENTCREATE:
-        cuda_event_create(msg, tid);
-        break;
-    case VIRTIO_CUDA_EVENTCREATEWITHFLAGS:
-        cuda_event_create_with_flags(msg, tid);
-        break;
-    case VIRTIO_CUDA_EVENTDESTROY:
-        cuda_event_destroy(msg, tid);
-        break;
-    case VIRTIO_CUDA_EVENTRECORD:
-        cuda_event_record(msg, tid);
-        break;
-    case VIRTIO_CUDA_EVENTSYNCHRONIZE:
-        cuda_event_synchronize(msg, tid);
-        break;
-    case VIRTIO_CUDA_EVENTELAPSEDTIME:
-        cuda_event_elapsedtime(msg, tid);
-        break;
-    case VIRTIO_CUDA_THREADSYNCHRONIZE:
-        cuda_thread_synchronize(msg, tid);
-        break;
-    case VIRTIO_CUDA_GETLASTERROR:
-        cuda_get_last_error(msg, tid);
-        break;
-    case VIRTIO_CUDA_MEMCPY_ASYNC:
-        cuda_memcpy_async(msg, tid);
-        break;
-    case VIRTIO_CUDA_MEMSET:
-        cuda_memset(msg, tid);
-        break;
-    case VIRTIO_CUDA_DEVICESYNCHRONIZE:
-        cuda_device_synchronize(msg, tid);
-        break;
-    case VIRTIO_CUDA_MEMGETINFO:
-        cuda_mem_get_info(msg, tid);
-        break;
-    case VIRTIO_CUDA_MEMCPYTOSYMBOL:
-        cuda_memcpy_to_symbol(msg, tid);
-        break;
-    case VIRTIO_CUDA_MEMCPYFROMSYMBOL:
-        cuda_memcpy_from_symbol(msg, tid);
-        break;
-    case VIRTIO_CUDA_REGISTERVAR:
-        cuda_register_var(msg, tid);
-        break;
-    case VIRTIO_CUDA_STREAMWAITEVENT:
-        cuda_stream_wait_event(msg, tid);
-        break;
-    case VIRTIO_CUDA_STREAMSYNCHRONIZE:
-        cuda_stream_synchronize(msg, tid);
-        break;
-    default:
-        error("[+] header.cmd=%u, nr= %u \n",
-              msg->cmd, _IOC_NR(msg->cmd));
-        return 0;
-    }
-    ret = virtio_serial_write(port, (const uint8_t *)msg, 
-                                  sizeof(VirtIOArg));
-    if (ret < sizeof(VirtIOArg)) {
-            error("write error.\n");
-            virtio_serial_throttle_port(port, true);
-        }
-    free(msg);
-    debug("[+] WRITE BACK\n");
+    chan_send(worker_queue[tid], (void *)buf);
     return 0;
 }
 
@@ -2303,12 +2171,11 @@ static void virtconsole_enable_backend(VirtIOSerialPort *port, bool enable)
         if (!total_port)
             return;
         thread_id = port_id; //%total_port;
-        debug("Ending subprocess %d !\n",thread_id);
         /*
-        * kill tid child process
+        * kill tid thread
         */
-        int cmd = 0;
-        write(pfd[thread_id][WRITE], &cmd, 4);
+        debug("Closing thread %d !\n",thread_id);
+        chan_close(worker_queue[thread_id]);
         return;
     }
     if(enable && !global_deinitialized)
@@ -2349,6 +2216,7 @@ static void init_device_module(CudaContext *ctx)
 
 static void spawn_subprocess_by_port(VirtIOSerialPort *port)
 {
+    return;
     pid_t cpid =0;
     int port_id = port->id;
     int tid = port_id; //%total_port;
@@ -2905,6 +2773,166 @@ static void spawn_subprocess_by_port(VirtIOSerialPort *port)
     close(cfd[tid][WRITE]);
 }
 
+/*
+* worker process of thread
+*/
+static void *worker_processor(void *arg)
+{
+    VirtIOArg *msg = (VirtIOArg *)malloc(sizeof(VirtIOArg));;
+    int ret=0;
+    VirtIOSerialPort *port = (VirtIOSerialPort*)arg;
+    int port_id = port->id;
+    int tid = port_id;
+    while (chan_recv(worker_queue[tid], (void**)&msg) == 0)
+    {
+        switch(msg->cmd) {
+            case VIRTIO_CUDA_HELLO:
+                cuda_gpa_to_hva(msg);
+                break;
+            case VIRTIO_CUDA_REGISTERFATBINARY:
+                cuda_register_fatbinary(msg, tid);
+                break;
+            case VIRTIO_CUDA_UNREGISTERFATBINARY:
+                cuda_unregister_fatbinary(msg, tid);
+                break;
+            case VIRTIO_CUDA_REGISTERFUNCTION:
+                cuda_register_function(msg, tid);
+                break;
+            case VIRTIO_CUDA_LAUNCH:
+                cuda_launch(msg, tid);
+                break;
+            case VIRTIO_CUDA_MALLOC:
+                cuda_malloc(msg, tid);
+                break;
+            case VIRTIO_CUDA_HOSTREGISTER:
+                cuda_host_register(msg, tid);
+                break;
+            case VIRTIO_CUDA_HOSTUNREGISTER:
+                cuda_host_unregister(msg, tid);
+                break;
+            case VIRTIO_CUDA_MEMCPY:
+                cuda_memcpy(msg, tid);
+                break;
+            case VIRTIO_CUDA_FREE:
+                cuda_free(msg, tid);
+                break;
+            case VIRTIO_CUDA_GETDEVICE:
+                cuda_get_device(msg, tid);
+                break;
+            case VIRTIO_CUDA_GETDEVICEPROPERTIES:
+                cuda_get_device_properties(msg);
+                break;
+            case VIRTIO_CUDA_CONFIGURECALL:
+                break;
+            case VIRTIO_CUDA_SETUPARGUMENT:
+                cuda_setup_argument(msg);
+                break;
+            case VIRTIO_CUDA_GETDEVICECOUNT:
+                cuda_get_device_count(msg);
+                break;
+            case VIRTIO_CUDA_SETDEVICE:
+                cuda_set_device(msg, tid);
+                break;
+            case VIRTIO_CUDA_SETDEVICEFLAGS:
+                cuda_set_device_flags(msg, tid);
+                break;
+            case VIRTIO_CUDA_DEVICERESET:
+                cuda_device_reset(msg, tid);
+                break;
+            case VIRTIO_CUDA_STREAMCREATE:
+                cuda_stream_create(msg, tid);
+                break;
+            case VIRTIO_CUDA_STREAMDESTROY:
+                cuda_stream_destroy(msg, tid);
+                break;
+            case VIRTIO_CUDA_EVENTCREATE:
+                cuda_event_create(msg, tid);
+                break;
+            case VIRTIO_CUDA_EVENTCREATEWITHFLAGS:
+                cuda_event_create_with_flags(msg, tid);
+                break;
+            case VIRTIO_CUDA_EVENTDESTROY:
+                cuda_event_destroy(msg, tid);
+                break;
+            case VIRTIO_CUDA_EVENTRECORD:
+                cuda_event_record(msg, tid);
+                break;
+            case VIRTIO_CUDA_EVENTSYNCHRONIZE:
+                cuda_event_synchronize(msg, tid);
+                break;
+            case VIRTIO_CUDA_EVENTELAPSEDTIME:
+                cuda_event_elapsedtime(msg, tid);
+                break;
+            case VIRTIO_CUDA_THREADSYNCHRONIZE:
+                cuda_thread_synchronize(msg, tid);
+                break;
+            case VIRTIO_CUDA_GETLASTERROR:
+                cuda_get_last_error(msg, tid);
+                break;
+            case VIRTIO_CUDA_MEMCPY_ASYNC:
+                cuda_memcpy_async(msg, tid);
+                break;
+            case VIRTIO_CUDA_MEMSET:
+                cuda_memset(msg, tid);
+                break;
+            case VIRTIO_CUDA_DEVICESYNCHRONIZE:
+                cuda_device_synchronize(msg, tid);
+                break;
+            case VIRTIO_CUDA_MEMGETINFO:
+                cuda_mem_get_info(msg, tid);
+                break;
+            case VIRTIO_CUDA_MEMCPYTOSYMBOL:
+                cuda_memcpy_to_symbol(msg, tid);
+                break;
+            case VIRTIO_CUDA_MEMCPYFROMSYMBOL:
+                cuda_memcpy_from_symbol(msg, tid);
+                break;
+            case VIRTIO_CUDA_REGISTERVAR:
+                cuda_register_var(msg, tid);
+                break;
+            case VIRTIO_CUDA_STREAMWAITEVENT:
+                cuda_stream_wait_event(msg, tid);
+                break;
+            case VIRTIO_CUDA_STREAMSYNCHRONIZE:
+                cuda_stream_synchronize(msg, tid);
+                break;
+            default:
+                error("[+] header.cmd=%u, nr= %u \n",
+                      msg->cmd, _IOC_NR(msg->cmd));
+        }
+        ret = virtio_serial_write(port, (const uint8_t *)msg, 
+                                  sizeof(VirtIOArg));
+        if (ret < sizeof(VirtIOArg)) {
+            error("write error.\n");
+            virtio_serial_throttle_port(port, true);
+        }
+        debug("[+] WRITE BACK\n");
+    }
+    // Notify that all jobs were received.
+    printf("Shutting the thread %d\n", tid);
+    return NULL;
+}
+static void spawn_thread_by_port(VirtIOSerialPort *port)
+{
+    char thread_name[16];
+    int port_id = port->id;
+    int tid = port_id; //%total_port;
+    debug("Starting thread %d computing workloads and queue!\n",tid);
+
+    // initialize message pipe
+    cudaDevices[tid].device = (port_id-1)%total_device;
+    /*reserved index 0 for thread*/
+    memset(&cudaStreamBitmap[tid], ~0, sizeof(cudaStreamBitmap[tid]));
+    memset(cudaEventBitmap[tid], ~0, sizeof(cudaEventBitmap[tid]));
+    memset(cudaEvent[tid], 0, sizeof(cudaEvent_t)*CudaEventMaxNum);
+    memset(cudaStream[tid], 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
+    cudaModuleNum[tid]=0;
+    worker_queue[tid]   = chan_init(0);
+    sprintf(thread_name, "thread%d", tid);
+    qemu_thread_create(&worker_threads[tid], thread_name, 
+            worker_processor, port, QEMU_THREAD_JOINABLE);
+}
+
 /* 
 * Guest is now ready to accept data (virtqueues set up). 
 * When the guest has asked us for this information it means
@@ -3001,7 +3029,7 @@ static void virtconsole_realize(DeviceState *dev, Error **errp)
     init_device_once(vser);
     init_port(port);
     spawn_subprocess_by_port(port);
-
+    spawn_thread_by_port(port);
 }
 
 /*
