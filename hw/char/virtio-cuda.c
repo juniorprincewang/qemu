@@ -25,8 +25,7 @@
 // #include <driver_types.h>   // cudaDeviceProp
 
 #include "virtio-ioc.h"
-// #include "message_queue.h"
-#include "memorypool.h"
+// #include "memorypool.h"
 #include "list.h"
 
 #include <openssl/hmac.h> // hmac EVP_MAX_MD_SIZE
@@ -74,11 +73,6 @@ typedef long long unsigned int word_t;
 enum{BITS_PER_WORD = sizeof(word_t) * CHAR_BIT}; // BITS_PER_WORD=64
 #define WORD_OFFSET(b) ((b)/BITS_PER_WORD)
 #define BIT_OFFSET(b) ((b)%BITS_PER_WORD)
-
-
-static const mem_size_t max_mem = 2 * GB ;
-static const mem_size_t mem_pool_size = 1 * GB ;
-// static MemoryPool* mpool;
 
 typedef struct VirtConsole {
     VirtIOSerialPort parent_obj;
