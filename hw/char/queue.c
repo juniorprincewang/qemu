@@ -10,7 +10,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "queue.h"
+#include "hw/virtio/queue.h"
 
 #if defined(_WIN32) && !defined(ENOBUFS)
 #include <winsock.h>

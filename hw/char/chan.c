@@ -20,8 +20,8 @@
 #include <mach/mach.h>
 #endif
 
-#include "chan.h"
-#include "queue.h"
+#include "hw/virtio/chan.h"
+#include "hw/virtio/queue.h"
 
 #ifdef _WIN32
 #include <windows.h>

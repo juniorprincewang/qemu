@@ -22,6 +22,101 @@
 
 #include "cuda.h"
 #include "cuda_runtime.h"
+#include "chan.h"
+#include "list.h"
+
+#define CudaContextMaxNum   8
+#define CudaModuleMaxNum    8
+#define CudaFunctionMaxNum  32
+#define CudaVariableMaxNum  32
+
+#define CudaEventMapMax 4
+#define CudaEventMaxNum BITS_PER_WORD * CudaEventMapMax
+#define CudaStreamMaxNum BITS_PER_WORD
+#define VOL_OFFSET 0x1000
+#define NAME_LEN 32
+#define FILE_PATH_LEN 64
+
+/* bitmap */
+typedef long long unsigned int word_t;
+enum{BITS_PER_WORD = sizeof(word_t) * CHAR_BIT}; // BITS_PER_WORD=64
+#define WORD_OFFSET(b) ((b)/BITS_PER_WORD)
+#define BIT_OFFSET(b) ((b)%BITS_PER_WORD)
+
+typedef struct VirtualObjectList {
+    uint64_t addr;
+    uint64_t v_addr;
+    int size;
+    struct list_head list;
+} VOL;
+
+typedef struct HostVirtualObjectList {
+    uint64_t native_addr;
+    uint64_t actual_addr;
+    uint64_t virtual_addr;
+    size_t size;
+    struct list_head list;
+    char file_path[FILE_PATH_LEN];
+} HVOL;
+
+// Function String Name and a pointer to the CUDA Kernel Function
+typedef struct CudaKernel
+{
+    CUfunction  kernel_func;
+    char        *func_name;
+    int         func_name_size;
+    size_t      func_id;
+} CudaKernel;
+
+// Global Memory Name and the device pointer
+typedef struct CudaMemVar
+{
+    CUdeviceptr device_ptr;
+    size_t      mem_size;
+    char        *addr_name;
+    int         addr_name_size;
+    size_t      host_var;
+    bool        global;
+} CudaMemVar;
+
+typedef struct CUModuleContext
+{
+    CudaKernel      cudaKernels[CudaFunctionMaxNum];  // stores the data, strings for the CUDA kernels
+    CudaMemVar      cudaVars[CudaVariableMaxNum];     // stores the data, strings for the Global Memory (Device Pointers)
+    CUmodule        module;
+    size_t          handle;
+    void            *fatbin;
+    int             fatbin_size;
+    int             cudaKernelsCount;
+    int             cudaVarsCount;
+} CudaModule;
+
+typedef struct CUDeviceContext
+{
+    CUdevice        dev;
+    CUcontext       context;
+    CudaModule      modules[CudaModuleMaxNum];
+    int             moduleCount;
+
+    CUevent         cudaEvent[CudaEventMaxNum];
+    word_t          cudaEventBitmap[CudaEventMapMax];
+    CUstream        cudaStream[CudaStreamMaxNum];
+    word_t          cudaStreamBitmap;
+    struct list_head    vol;
+    pthread_spinlock_t  vol_lock;
+    struct list_head    host_vol;
+}CudaContext;
+
+#define DEFAULT_DEVICE 0
+typedef struct ThreadContext
+{
+    CudaContext     *contexts;
+    int             deviceCount;
+    int             cur_dev;
+    unsigned char   deviceBitmap;
+    chan_t          *worker_queue;
+    QemuThread      worker_thread;
+}ThreadContext;
 
 struct virtio_serial_conf {
     /* Max. number of ports we can have for a virtio-serial device */
@@ -149,6 +244,8 @@ struct VirtIOSerialPort {
     bool host_connected;
     /* Do apps not want to receive data? */
     bool throttled;
+    /* private cuda context */
+    // ThreadContext *thread_context;
 };
 
 /* The virtio-serial bus on top of which the ports will ride as devices */
