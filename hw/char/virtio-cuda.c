@@ -80,8 +80,6 @@ typedef struct KernelConf {
     cudaStream_t stream;
 } KernelConf_t ;
 
-static ThreadContext *thread_context;
-
 static int total_device;   // total GPU device
 static int total_port;     // port count
 static QemuMutex total_port_mutex;
@@ -349,10 +347,11 @@ static void cuda_register_fatbinary(VirtIOArg *arg, ThreadContext *tctx)
     cpu_physical_memory_read((hwaddr)arg->dst, fat_bin, fatbin_size);
 
     m_idx = ctx->moduleCount++;
-    // debug("fat_bin gpa is 0x%lx\n", *(uint64_t*)fat_bin);
-    debug("fat_bin is 0x%lx\n", (uint64_t)fat_bin);
     debug("fat_bin gva is 0x%lx\n", (uint64_t)arg->src);
+    debug("fat_bin gpa is 0x%lx\n", (uint64_t)arg->dst);
     debug("fat_bin size is 0x%x\n", fatbin_size);
+    debug("fat_bin hva is 0x%lx\n", (uint64_t)fat_bin);
+    debug("fat_bin hva is at %p\n", fat_bin);
     debug("module = %d\n", m_idx);
     ctx->modules[m_idx].handle              = (size_t)arg->src;
     ctx->modules[m_idx].fatbin_size         = fatbin_size;
@@ -1834,13 +1833,15 @@ static void cuda_gpa_to_hva(VirtIOArg *arg)
 static ssize_t flush_buf(VirtIOSerialPort *port,
                          const uint8_t *buf, ssize_t len)
 {
+    VirtIOArg *msg = NULL;
     debug("port->id=%d, len=%ld\n", port->id, len);
     if (len != sizeof(VirtIOArg)) {
         error("buf len should be %lu, not %ld\n", sizeof(VirtIOArg), len);
         return 0;
     }
-    // chan_send(port->thread_context->worker_queue, (void *)buf);
-    chan_send(thread_context->worker_queue, (void *)buf);
+    msg = (VirtIOArg *)malloc(sizeof(VirtIOArg));
+    memcpy((void *)msg, (void *)buf, len);
+    chan_send(port->thread_context->worker_queue, (void *)msg);
     return 0;
 }
 
@@ -1878,8 +1879,7 @@ static void virtconsole_enable_backend(VirtIOSerialPort *port, bool enable)
         * kill tid thread
         */
         debug("Closing thread %d !\n",thread_id);
-        // chan_close(port->thread_context->worker_queue);
-        chan_close(thread_context->worker_queue);
+        chan_close(port->thread_context->worker_queue);
         return;
     }
     if(enable && !global_deinitialized)
@@ -1926,8 +1926,7 @@ static void *worker_processor(void *arg)
     VirtIOArg *msg = (VirtIOArg *)malloc(sizeof(VirtIOArg));;
     int ret=0;
     VirtIOSerialPort *port = (VirtIOSerialPort*)arg;
-    // ThreadContext *tctx = port->thread_context;
-    ThreadContext *tctx = thread_context;
+    ThreadContext *tctx = port->thread_context;
     CudaContext *cudaContexts = tctx->contexts;
     int port_id = port->id;
     int tid = port_id;
@@ -2072,7 +2071,7 @@ static void spawn_thread_by_port(VirtIOSerialPort *port)
     debug("Starting thread %d computing workloads and queue!\n",thread_id);
     // spawn_thread_by_port(port);
     sprintf(thread_name, "thread_%d", thread_id);
-    qemu_thread_create(&thread_context->worker_thread, thread_name, 
+    qemu_thread_create(&port->thread_context->worker_thread, thread_name, 
             worker_processor, port, QEMU_THREAD_JOINABLE);
 }
 
@@ -2140,11 +2139,9 @@ static void deinit_device_once(VirtIOSerial *vser)
 static void init_port(VirtIOSerialPort *port)
 {
     ThreadContext *tctx = NULL;
-    // port->thread_context = malloc(sizeof(ThreadContext));
-    thread_context = malloc(sizeof(ThreadContext));
+    port->thread_context = malloc(sizeof(ThreadContext));
     CudaContext *ctx = NULL;
-    // tctx = port->thread_context;
-    tctx = thread_context;
+    tctx = port->thread_context;
     tctx->deviceCount = total_device;
     tctx->cur_dev = DEFAULT_DEVICE;
     memset(&tctx->deviceBitmap, 0, sizeof(tctx->deviceBitmap));
@@ -2167,8 +2164,7 @@ static void init_port(VirtIOSerialPort *port)
 
 static void deinit_port(VirtIOSerialPort *port)
 {
-    // ThreadContext *tctx = port->thread_context;
-    ThreadContext *tctx = thread_context;
+    ThreadContext *tctx = port->thread_context;
     int tid = port->id;
     /*delete elements in struct list_head*/
     /*

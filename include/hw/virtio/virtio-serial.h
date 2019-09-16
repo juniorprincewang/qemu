@@ -245,7 +245,7 @@ struct VirtIOSerialPort {
     /* Do apps not want to receive data? */
     bool throttled;
     /* private cuda context */
-    // ThreadContext *thread_context;
+    ThreadContext *thread_context;
 };
 
 /* The virtio-serial bus on top of which the ports will ride as devices */
