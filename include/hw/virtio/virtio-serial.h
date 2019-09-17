@@ -20,6 +20,7 @@
 #include "hw/qdev.h"
 #include "hw/virtio/virtio.h"
 
+
 #include "cuda.h"
 #include "cuda_runtime.h"
 #include "chan.h"
@@ -51,7 +52,6 @@ typedef struct VirtualObjectList {
 } VOL;
 
 typedef struct HostVirtualObjectList {
-    uint64_t native_addr;
     uint64_t actual_addr;
     uint64_t virtual_addr;
     size_t size;
