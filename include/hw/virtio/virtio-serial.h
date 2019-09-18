@@ -93,6 +93,7 @@ typedef struct CUModuleContext
 
 typedef struct CUDeviceContext
 {
+    int             initialized;
     CUdevice        dev;
     CUcontext       context;
     CudaModule      modules[CudaModuleMaxNum];
