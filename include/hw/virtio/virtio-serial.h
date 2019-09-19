@@ -52,24 +52,30 @@ typedef struct VirtualObjectList {
 } VOL;
 
 typedef struct HostVirtualObjectList {
-    uint64_t actual_addr;
+    uint64_t addr;
     uint64_t virtual_addr;
     size_t size;
+    int fd;
     struct list_head list;
-    char file_path[FILE_PATH_LEN];
 } HVOL;
 
+typedef struct CudaKernel CudaKernel;
+typedef struct CudaMemVar CudaMemVar;
+typedef struct CUModuleContext CudaModule;
+typedef struct CUDeviceContext CudaContext;
+typedef struct ThreadContext ThreadContext;
+
 // Function String Name and a pointer to the CUDA Kernel Function
-typedef struct CudaKernel
+struct CudaKernel
 {
     CUfunction  kernel_func;
     char        *func_name;
     int         func_name_size;
     size_t      func_id;
-} CudaKernel;
+};
 
 // Global Memory Name and the device pointer
-typedef struct CudaMemVar
+struct CudaMemVar
 {
     CUdeviceptr device_ptr;
     size_t      mem_size;
@@ -77,9 +83,9 @@ typedef struct CudaMemVar
     int         addr_name_size;
     size_t      host_var;
     bool        global;
-} CudaMemVar;
+};
 
-typedef struct CUModuleContext
+struct CUModuleContext
 {
     CudaKernel      cudaKernels[CudaFunctionMaxNum];  // stores the data, strings for the CUDA kernels
     CudaMemVar      cudaVars[CudaVariableMaxNum];     // stores the data, strings for the Global Memory (Device Pointers)
@@ -89,9 +95,10 @@ typedef struct CUModuleContext
     int             fatbin_size;
     int             cudaKernelsCount;
     int             cudaVarsCount;
-} CudaModule;
+};
 
-typedef struct CUDeviceContext
+
+struct CUDeviceContext
 {
     int             initialized;
     CUdevice        dev;
@@ -106,10 +113,11 @@ typedef struct CUDeviceContext
     struct list_head    vol;
     pthread_spinlock_t  vol_lock;
     struct list_head    host_vol;
-}CudaContext;
+    ThreadContext   *tctx;
+};
 
 #define DEFAULT_DEVICE 0
-typedef struct ThreadContext
+struct ThreadContext
 {
     CudaContext     *contexts;
     int             deviceCount;
@@ -117,7 +125,7 @@ typedef struct ThreadContext
     unsigned char   deviceBitmap;
     chan_t          *worker_queue;
     QemuThread      worker_thread;
-}ThreadContext;
+};
 
 struct virtio_serial_conf {
     /* Max. number of ports we can have for a virtio-serial device */
