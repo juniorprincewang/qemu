@@ -320,6 +320,28 @@ static void *gpa_to_hva(hwaddr gpa, int len)
     return hva;
 }
 
+static void deinit_primary_context(CudaContext *ctx)
+{
+    VOL *vol, *vol2;
+    HVOL *hvol, *hvol2;
+    ctx->dev         = 0;
+    ctx->moduleCount = 0;
+    ctx->initialized = 0;
+    memset(&ctx->cudaStreamBitmap, ~0, sizeof(ctx->cudaStreamBitmap));
+    memset(ctx->cudaEventBitmap, ~0, sizeof(sizeof(word_t)*CudaEventMapMax));
+    memset(ctx->cudaStream, 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
+    memset(ctx->cudaEvent, 0, sizeof(cudaEvent_t)*CudaEventMaxNum);
+    // free struct list
+    list_for_each_entry_safe(vol, vol2, &ctx->vol, list) {
+        list_del(&vol->list);
+        free(vol);
+    }
+    list_for_each_entry_safe(hvol, hvol2, &ctx->host_vol, list) {
+        list_del(&hvol->list);
+        free(hvol);
+    }
+}
+
 static void cuda_register_fatbinary(VirtIOArg *arg, ThreadContext *tctx)
 {
     void *fat_bin;
@@ -333,6 +355,7 @@ static void cuda_register_fatbinary(VirtIOArg *arg, ThreadContext *tctx)
         arg->cmd = cudaErrorUnknown;
         return;
     }*/
+    /*very first initialize in this port*/
     if (! (tctx->deviceBitmap & 1<<DEFAULT_DEVICE)) {
         tctx->cur_dev = DEFAULT_DEVICE;
         ctx->moduleCount = 0;
@@ -368,28 +391,6 @@ static void cuda_register_fatbinary(VirtIOArg *arg, ThreadContext *tctx)
     }
     */
     arg->cmd = cudaSuccess;
-}
-
-static void deinit_primary_context(CudaContext *ctx)
-{
-    VOL *vol, *vol2;
-    HVOL *hvol, *hvol2;
-    ctx->dev         = 0;
-    ctx->moduleCount = 0;
-    ctx->initialized = 0;
-    memset(&ctx->cudaStreamBitmap, ~0, sizeof(ctx->cudaStreamBitmap));
-    memset(ctx->cudaEventBitmap, ~0, sizeof(sizeof(word_t)*CudaEventMapMax));
-    memset(ctx->cudaStream, 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
-    memset(ctx->cudaEvent, 0, sizeof(cudaEvent_t)*CudaEventMaxNum);
-    // free struct list
-    list_for_each_entry_safe(vol, vol2, &ctx->vol, list) {
-        list_del(&vol->list);
-        free(vol);
-    }
-    list_for_each_entry_safe(hvol, hvol2, &ctx->host_vol, list) {
-        list_del(&hvol->list);
-        free(hvol);
-    }
 }
 
 static void cuda_unregister_fatbinary(VirtIOArg *arg, ThreadContext *tctx)
@@ -873,7 +874,7 @@ static void cuda_memcpy_async(VirtIOArg *arg, ThreadContext *tctx)
     void *src, *dst;
     int pos = 0;
     cudaStream_t stream=0;
-    uint32_t init_offset=0, blocks=0;
+    uint32_t blocks=0;
     CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
 
     func();
@@ -887,9 +888,6 @@ static void cuda_memcpy_async(VirtIOArg *arg, ThreadContext *tctx)
         arg->cmd = cudaErrorInvalidValue;
         return ;
     }
-    init_offset = arg->param & 0xffffffff;
-    debug("pos = 0x%x, blocks=0x%x, offset=0x%x\n",
-          arg->dstSize, blocks, init_offset);
     pos = arg->dstSize;
     if (pos==0) {
         stream=0;
@@ -1830,6 +1828,33 @@ static void set_guest_connected(VirtIOSerialPort *port, int guest_connected)
     if (dev->id) {
         qapi_event_send_vserport_change(dev->id, guest_connected,
                                         &error_abort);
+    }
+    if(guest_connected) {
+        ThreadContext *tctx = port->thread_context;
+        if (tctx->deviceBitmap != 0) {
+            tctx->deviceCount = total_device;
+            tctx->cur_dev = DEFAULT_DEVICE;
+            memset(&tctx->deviceBitmap, 0, sizeof(tctx->deviceBitmap));
+            for (int i = 0; i < tctx->deviceCount; i++)
+            {
+                CudaContext * ctx = &tctx->contexts[i];
+                memset(&ctx->cudaStreamBitmap,   ~0, sizeof(ctx->cudaStreamBitmap));
+                memset(ctx->cudaEventBitmap,     ~0, sizeof(sizeof(word_t)*CudaEventMapMax));
+                memset(ctx->cudaEvent,           0,  sizeof(cudaEvent_t) *CudaEventMaxNum);
+                memset(ctx->cudaStream,          0,  sizeof(cudaStream_t)*CudaStreamMaxNum);
+                INIT_LIST_HEAD(&ctx->vol);
+                INIT_LIST_HEAD(&ctx->host_vol);
+                ctx->moduleCount = 0;
+                ctx->initialized = 0;
+                ctx->tctx        = tctx;
+            }
+        }
+        gettimeofday(&port->start_time, NULL);
+    } else {
+        gettimeofday(&port->end_time, NULL);
+        time_spent = (double)(port->end_time.tv_usec - port->start_time.tv_usec)/1000000 +
+                    (double)(port->end_time.tv_sec - port->start_time.tv_sec);
+        printf("port %d spends %f seconds\n", port->id, time_spent);
     }
 }
 

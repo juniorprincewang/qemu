@@ -25,6 +25,7 @@
 #include "cuda_runtime.h"
 #include "chan.h"
 #include "list.h"
+#include <sys/time.h>
 
 #define CudaContextMaxNum   8
 #define CudaModuleMaxNum    8
@@ -96,7 +97,6 @@ struct CUModuleContext
     int             cudaKernelsCount;
     int             cudaVarsCount;
 };
-
 
 struct CUDeviceContext
 {
@@ -255,6 +255,8 @@ struct VirtIOSerialPort {
     bool throttled;
     /* private cuda context */
     ThreadContext *thread_context;
+    struct timeval start_time;
+    struct timeval end_time;
 };
 
 /* The virtio-serial bus on top of which the ports will ride as devices */
