@@ -872,7 +872,7 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
         src = malloc(size);
         if(arg->param) {
             int blocks = arg->param;
-            gpa_array = (uint64_t*)gpa_to_hva((hwaddr)arg->src, blocks);
+            gpa_array = (uint64_t*)gpa_to_hva((hwaddr)arg->param2, blocks);
             if(!gpa_array) {
                 error("No such address.\n");
                 arg->cmd = cudaErrorInvalidValue;
@@ -895,7 +895,7 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
             }
             assert(i == blocks);
         } else {
-            cpu_physical_memory_read((hwaddr)arg->src, src, size);
+            cpu_physical_memory_read((hwaddr)arg->param2, src, size);
         }
         // device address
         if( (addr = map_addr_by_vaddr(arg->dst, &cudaDevices[tid]))==0) {
@@ -944,7 +944,7 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
         // copy back to VM
         if(arg->param) {
             int blocks = arg->param;
-            gpa_array = (uint64_t*)gpa_to_hva((hwaddr)arg->dst, blocks);
+            gpa_array = (uint64_t*)gpa_to_hva((hwaddr)arg->param2, blocks);
             if(!gpa_array) {
                 error("Failed to get gpa_array.\n");
                 arg->cmd = cudaErrorInvalidValue;
@@ -967,7 +967,7 @@ static void cuda_memcpy(VirtIOArg *arg, int tid)
             }
             assert(i == blocks);
         } else {
-            cpu_physical_memory_write((hwaddr)arg->dst, dst, size);
+            cpu_physical_memory_write((hwaddr)arg->param2, dst, size);
         }
     } else if (arg->flag == cudaMemcpyDeviceToDevice) {
         if( (addr = map_addr_by_vaddr(arg->src, &cudaDevices[tid]))==0) {
