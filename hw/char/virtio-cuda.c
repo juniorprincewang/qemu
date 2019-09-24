@@ -1852,7 +1852,7 @@ static void set_guest_connected(VirtIOSerialPort *port, int guest_connected)
         gettimeofday(&port->start_time, NULL);
     } else {
         gettimeofday(&port->end_time, NULL);
-        time_spent = (double)(port->end_time.tv_usec - port->start_time.tv_usec)/1000000 +
+        double time_spent = (double)(port->end_time.tv_usec - port->start_time.tv_usec)/1000000 +
                     (double)(port->end_time.tv_sec - port->start_time.tv_sec);
         printf("port %d spends %f seconds\n", port->id, time_spent);
     }
