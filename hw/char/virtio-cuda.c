@@ -361,8 +361,6 @@ static void cuda_register_fatbinary(VirtIOArg *arg, ThreadContext *tctx)
         ctx->moduleCount = 0;
         memset(ctx->modules, 0, sizeof(ctx->modules));
         cuErrorExit(cuDeviceGet(&ctx->dev, DEFAULT_DEVICE));
-        // cuErrorExit(cuDevicePrimaryCtxRetain(&ctx->context, ctx->dev));
-        // cuErrorExit(cuCtxCreate(&ctx->context, 0, ctx->dev));
     }
     fat_bin = malloc(fatbin_size);
     cpu_physical_memory_read((hwaddr)arg->dst, fat_bin, fatbin_size);
@@ -379,9 +377,6 @@ static void cuda_register_fatbinary(VirtIOArg *arg, ThreadContext *tctx)
     ctx->modules[m_idx].cudaKernelsCount    = 0;
     ctx->modules[m_idx].cudaVarsCount       = 0;
     ctx->modules[m_idx].fatbin              = fat_bin;
-    // cuErrorExit(cuCtxPushCurrent(ctx->context));
-    // cuErrorExit(cuModuleLoadData(&ctx->modules[m_idx].module, fat_bin));
-    // cuErrorExit(cuCtxPopCurrent(&ctx->context));
     
     //assert(*(uint64_t*)fat_bin ==  *(uint64_t*)fatBinAddr);
     /* check binary
@@ -415,7 +410,8 @@ static void cuda_unregister_fatbinary(VirtIOArg *arg, ThreadContext *tctx)
                 free(mod->fatbin);
                 memset(mod, 0, sizeof(CudaModule));
             }
-            cuErrorExit(cuDevicePrimaryCtxRelease(ctx->dev));
+            // cuErrorExit(cuDevicePrimaryCtxRelease(ctx->dev));
+            cuError(cuCtxDestroy(ctx->context));
             deinit_primary_context(ctx);
         }
     }
@@ -472,9 +468,6 @@ static void cuda_register_function(VirtIOArg *arg, ThreadContext *tctx)
             " name size=0x%x, func_id=0x%lx, kernel_count = %d\n", 
             fatbin_handle, fatbin_size, kernel->func_name,
             name_size, func_id, kernel_count);
-    // cuErrorExit(cuCtxPushCurrent(ctx->context));
-    // cuErrorExit(cuModuleGetFunction(&kernel->kernel_func, cuda_module->module, kernel->func_name));
-    // cuErrorExit(cuCtxPopCurrent(&ctx->context));
     arg->cmd = cudaSuccess;
 }
 
@@ -530,9 +523,6 @@ static void cuda_register_var(VirtIOArg *arg, ThreadContext *tctx)
             " name size=0x%x, host_var=0x%lx, var_count = %d, global =%d\n", 
             fatbin_handle, fatbin_size, var->addr_name,
             name_size, host_var, var_count, var->global);
-    // cuErrorExit(cuCtxPushCurrent(ctx->context));
-    // cuErrorExit(cuModuleGetGlobal(&var->device_ptr, &var->mem_size, cuda_module->module, var->addr_name));
-    // cuErrorExit(cuCtxPopCurrent(&ctx->context));
     arg->cmd = cudaSuccess;
 }
 
@@ -554,7 +544,6 @@ static void cuda_set_device(VirtIOArg *arg, ThreadContext *tctx)
         ctx = &tctx->contexts[dev_id];
         memcpy(ctx->modules, &tctx->contexts[DEFAULT_DEVICE].modules, 
                 sizeof(ctx->modules));
-        // init_device_module(ctx);
         cuErrorExit(cuDeviceGet(&ctx->dev, dev_id));
     }
     cudaError(err = cudaSetDevice(dev_id));
@@ -592,8 +581,9 @@ static void init_device_module(CudaContext *ctx)
 static void init_primary_context(CudaContext *ctx)
 {
     if(!ctx->initialized) {
-        cuErrorExit(cuDevicePrimaryCtxRetain(&ctx->context, ctx->dev));
-        cuErrorExit(cuCtxSetCurrent(ctx->context));
+        // cuErrorExit(cuDevicePrimaryCtxRetain(&ctx->context, ctx->dev));
+        // cuErrorExit(cuCtxSetCurrent(ctx->context));
+        cuError(cuCtxCreate(&ctx->context, 0, ctx->dev));
         ctx->initialized = 1;
         ctx->tctx->deviceBitmap |= 1<< ctx->tctx->cur_dev;
         init_device_module(ctx);
@@ -1424,13 +1414,15 @@ static void cuda_get_device_count(VirtIOArg *arg)
 
 static void cuda_device_reset(VirtIOArg *arg, ThreadContext *tctx)
 {
+    cudaError_t err = -1;
     CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
     func();
 
-    cuErrorExit(cuDevicePrimaryCtxReset(ctx->dev));
+    // cuErrorExit(cuDevicePrimaryCtxReset(ctx->dev));
+    execute_with_context(err = cudaDeviceReset(), ctx->context);
     deinit_primary_context(ctx);
     tctx->deviceBitmap &= ~(1 << tctx->cur_dev);
-    arg->cmd = cudaSuccess;
+    arg->cmd = err;
     debug("reset devices\n");
 }
 
@@ -1852,7 +1844,7 @@ static void set_guest_connected(VirtIOSerialPort *port, int guest_connected)
         gettimeofday(&port->start_time, NULL);
     } else {
         gettimeofday(&port->end_time, NULL);
-        time_spent = (double)(port->end_time.tv_usec - port->start_time.tv_usec)/1000000 +
+        double time_spent = (double)(port->end_time.tv_usec - port->start_time.tv_usec)/1000000 +
                     (double)(port->end_time.tv_sec - port->start_time.tv_sec);
         printf("port %d spends %f seconds\n", port->id, time_spent);
     }
