@@ -28,9 +28,9 @@
 #include <sys/time.h>
 
 #define CudaContextMaxNum   8
-#define CudaModuleMaxNum    8
-#define CudaFunctionMaxNum  32
-#define CudaVariableMaxNum  32
+#define CudaModuleMaxNum    1<<4
+#define CudaFunctionMaxNum  1<<8
+#define CudaVariableMaxNum  1<<8
 
 #define CudaEventMapMax 4
 #define CudaEventMaxNum BITS_PER_WORD * CudaEventMapMax
