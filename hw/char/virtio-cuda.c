@@ -892,7 +892,6 @@ static void cuda_memcpy_async(VirtIOArg *arg, ThreadContext *tctx)
     void *src, *dst;
     int pos = 0;
     cudaStream_t stream=0;
-    uint32_t blocks=0;
     CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
 
     func();
@@ -900,12 +899,6 @@ static void cuda_memcpy_async(VirtIOArg *arg, ThreadContext *tctx)
     debug("src=0x%lx, srcSize=0x%x, dst=0x%lx, dstSize=0x%x, kind=%lu, "
         "stream=0x%lx \n",
         arg->src, arg->srcSize, arg->dst, arg->dstSize, arg->flag, arg->param);
-    blocks = arg->param >> 32;
-    if(blocks==0) {
-        error("Failed to get blocks\n");
-        arg->cmd = cudaErrorInvalidValue;
-        return ;
-    }
     pos = arg->dstSize;
     if (pos==0) {
         stream=0;
@@ -925,13 +918,23 @@ static void cuda_memcpy_async(VirtIOArg *arg, ThreadContext *tctx)
             arg->cmd=cudaErrorInvalidValue;
             return;
         }
-        if((src = (void*)map_host_addr_by_vaddr(arg->src, &ctx->host_vol))==0) {
-            error("Failed to find virtual addr %p in host vol\n", (void *)arg->src);
-            arg->cmd = cudaErrorInvalidValue;
-            return;
+        if(arg->param) {
+            if( (src = (void*)map_host_addr_by_vaddr(arg->src, &ctx->host_vol))==NULL) {
+                error("Failed to find virtual addr %p in host vol\n", (void *)arg->src);
+                arg->cmd = cudaErrorInvalidValue;
+                return;
+            }
+        } else {
+            if((src= gpa_to_hva((hwaddr)arg->param2, size)) == NULL) {
+                error("No such physical address 0x%lx.\n", arg->param2);
+                arg->cmd = cudaErrorInvalidValue;
+                return;
+            }
         }
         execute_with_context((err= cudaMemcpyAsync(dst, src, size, 
                             cudaMemcpyHostToDevice, stream)), ctx->context);
+        debug("src = %p\n", src);
+        debug("dst = %p\n", dst);
         arg->cmd = err;
         if(err != cudaSuccess) {
             error("memcpy async HtoD error!\n");
@@ -944,10 +947,18 @@ static void cuda_memcpy_async(VirtIOArg *arg, ThreadContext *tctx)
             arg->cmd = cudaErrorInvalidValue;
             return;
         }
-        if((dst = (void*)map_host_addr_by_vaddr(arg->dst, &ctx->host_vol))==0) {
-            error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
-            arg->cmd = cudaErrorInvalidValue;
-            return;
+        if(arg->param) {
+            if( (dst = (void*)map_host_addr_by_vaddr(arg->dst, &ctx->host_vol))==0) {
+                error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+                arg->cmd = cudaErrorInvalidValue;
+                return;
+            }
+        } else {
+            if((dst= gpa_to_hva((hwaddr)arg->param2, size)) == NULL) {
+                error("No such physical address 0x%lx.\n", arg->param2);
+                arg->cmd = cudaErrorInvalidValue;
+                return;
+            }
         }
         execute_with_context( (err=cudaMemcpyAsync(dst, src, size, 
                         cudaMemcpyDeviceToHost, stream)), ctx->context );
@@ -1343,6 +1354,7 @@ static void cuda_host_register(VirtIOArg *arg, VirtIOSerialPort *port)
             return;
         }
     }
+    debug("ptr = %p\n", ptr);
     execute_with_context((err = cudaHostRegister(ptr, size, flags)), ctx->context);
     arg->cmd = err;
     if (err != cudaSuccess) {
@@ -1601,7 +1613,6 @@ static void cuda_event_create(VirtIOArg *arg, ThreadContext *tctx)
         error("event number is up to %d\n", CudaEventMaxNum);
         return;
     }
-    // cudaError(err = cudaEventCreate(&ctx->cudaEvent[pos-1]));
     execute_with_context(err = cudaEventCreate(&ctx->cudaEvent[pos-1]), ctx->context);
     arg->cmd = err;
     if (err != cudaSuccess) {
@@ -1659,7 +1670,7 @@ static void cuda_event_destroy(VirtIOArg *arg, ThreadContext *tctx)
         arg->cmd=cudaErrorInvalidValue;
         return;
     }
-    debug("destroy event 0x%lx\n", (uint64_t)ctx->cudaEvent[pos-1]);
+    debug("destroy event [pos=%d] 0x%lx\n", pos, (uint64_t)ctx->cudaEvent[pos-1]);
     // cudaError( (err=cudaEventDestroy(ctx->cudaEvent[pos-1])) );
     execute_with_context( (err=cudaEventDestroy(ctx->cudaEvent[pos-1])), ctx->context);
     arg->cmd = err;
@@ -1788,7 +1799,8 @@ static void cuda_event_elapsedtime(VirtIOArg *arg, ThreadContext *tctx)
         error("event calc elapsed time error.\n");
         return;
     }
-    arg->flag = (uint64_t)time;
+    debug("elapsed time=%g\n", time);
+    cpu_physical_memory_write((hwaddr)arg->param2, &time, arg->paramSize);
 }
 
 static void cuda_device_synchronize(VirtIOArg *arg, ThreadContext *tctx)
@@ -2805,7 +2817,7 @@ static void unload_module(ThreadContext *tctx)
             ctx = &tctx->contexts[idx];
             for (i=0; i < ctx->moduleCount; i++) {
                 mod = &ctx->modules[i];
-                debug("Unload module 0x%lx\n", mod->handle);
+                // debug("Unload module 0x%lx\n", mod->handle);
                 for(int j=0; j<mod->cudaKernelsCount; j++) {
                     free(mod->cudaKernels[j].func_name);
                 }
