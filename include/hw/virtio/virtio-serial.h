@@ -28,7 +28,7 @@
 #include <sys/time.h>
 
 #define CudaContextMaxNum   8
-#define CudaModuleMaxNum    (1<<6)
+#define CudaModuleMaxNum    (1<<8)
 #define CudaFunctionMaxNum  (1<<8)
 #define CudaVariableMaxNum  (1<<8)
 
@@ -40,7 +40,8 @@
 #define FILE_PATH_LEN 64
 
 /* bitmap */
-typedef long long unsigned int word_t;
+// typedef long long unsigned int word_t;
+typedef unsigned int word_t;
 enum{BITS_PER_WORD = sizeof(word_t) * CHAR_BIT}; // BITS_PER_WORD=64
 #define WORD_OFFSET(b) ((b)/BITS_PER_WORD)
 #define BIT_OFFSET(b) ((b)%BITS_PER_WORD)

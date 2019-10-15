@@ -24,8 +24,8 @@
 #include <cuda_runtime.h>
 #include <builtin_types.h> //PATH: /usr/local/cuda/include/builtin_types.h
 // #include <driver_types.h>   // cudaDeviceProp
-#include <cublas_v2.h> 
-
+#include <cublas_v2.h>
+#include <curand.h>
 #include "virtio-ioc.h"
 #include <openssl/hmac.h> // hmac EVP_MAX_MD_SIZE
 /*Encodes Base64 */
@@ -144,6 +144,14 @@ static inline void __cuErrorCheck(cudaError_t err, const int line)
         cublasStatus_t __err = fn; \
         if (__err != CUBLAS_STATUS_SUCCESS) { \
             error("Fatal cublas error: %d (at %s:%d)\n", \
+                (int)(__err), __FILE__, __LINE__); \
+        } \
+}
+
+#define curandCheck(fn) { \
+        curandStatus_t __err = fn; \
+        if (__err != CURAND_STATUS_SUCCESS) { \
+            error("Fatal curand error: %d (at %s:%d)\n", \
                 (int)(__err), __FILE__, __LINE__); \
         } \
 }
@@ -338,7 +346,7 @@ static void deinit_primary_context(CudaContext *ctx)
     ctx->moduleCount = 0;
     ctx->initialized = 0;
     memset(&ctx->cudaStreamBitmap, ~0, sizeof(ctx->cudaStreamBitmap));
-    memset(ctx->cudaEventBitmap, ~0, sizeof(sizeof(word_t)*CudaEventMapMax));
+    memset(&ctx->cudaEventBitmap, ~0, sizeof(ctx->cudaEventBitmap));
     memset(ctx->cudaStream, 0, sizeof(cudaStream_t)*CudaStreamMaxNum);
     memset(ctx->cudaEvent, 0, sizeof(cudaEvent_t)*CudaEventMaxNum);
     // free struct list
@@ -897,9 +905,10 @@ static void cuda_memcpy_async(VirtIOArg *arg, ThreadContext *tctx)
     func();
     init_primary_context(ctx);
     debug("src=0x%lx, srcSize=0x%x, dst=0x%lx, dstSize=0x%x, kind=%lu, "
-        "stream=0x%lx \n",
-        arg->src, arg->srcSize, arg->dst, arg->dstSize, arg->flag, arg->param);
-    pos = arg->dstSize;
+        "stream=0x%lx , src2=0x%lx\n",
+        arg->src, arg->srcSize, arg->dst, arg->dstSize, arg->flag, 
+        arg->param, arg->src2);
+    pos = arg->src2;
     if (pos==0) {
         stream=0;
     } else if (!__get_bit(&ctx->cudaStreamBitmap, pos-1)) {
@@ -1470,7 +1479,7 @@ static void cuda_stream_create(VirtIOArg *arg, ThreadContext *tctx)
     
     func();
     init_primary_context(ctx);
-    pos = ffsll(ctx->cudaStreamBitmap);
+    pos = ffs(ctx->cudaStreamBitmap);
     if (!pos) {
         error("stream number is up to %d\n", CudaStreamMaxNum);
         return;
@@ -1497,7 +1506,7 @@ static void cuda_stream_create_with_flags(VirtIOArg *arg, ThreadContext *tctx)
     
     func();
     init_primary_context(ctx);
-    pos = ffsll(ctx->cudaStreamBitmap);
+    pos = ffs(ctx->cudaStreamBitmap);
     if (!pos) {
         error("stream number is up to %d\n", CudaStreamMaxNum);
         return;
@@ -1506,7 +1515,7 @@ static void cuda_stream_create_with_flags(VirtIOArg *arg, ThreadContext *tctx)
     execute_with_context( (err=cudaStreamCreateWithFlags(&ctx->cudaStream[pos-1], flag)), ctx->context);
     arg->cmd = err;
     if (err != cudaSuccess) {
-        error("create event with flags error.\n");
+        error("create stream with flags error.\n");
         return;
     }
     arg->dst = (uint64_t)pos;
@@ -1588,8 +1597,8 @@ static void cuda_stream_wait_event(VirtIOArg *arg, ThreadContext *tctx)
         return;
     }
     event = ctx->cudaEvent[pos-1];
+    // event = (cudaEvent_t)arg->dst;
     debug("wait for event 0x%lx\n", (uint64_t)event);    
-    // cudaError(err = cudaStreamWaitEvent(stream, event, 0));
     execute_with_context(err = cudaStreamWaitEvent(stream, event, 0), ctx->context);
     arg->cmd = err;
     if (err != cudaSuccess) {
@@ -1602,17 +1611,29 @@ static void cuda_event_create(VirtIOArg *arg, ThreadContext *tctx)
     cudaError_t err = -1;
     uint32_t pos = 0;
     CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
-    
+    // cudaEvent_t event;
     func();
     init_primary_context(ctx);
-    for(int i=0; i<CudaEventMapMax; i++) {    
-        pos = ffsll(ctx->cudaEventBitmap[i]);
-        if(pos) break;
+    /*
+    execute_with_context(err = cudaEventCreate(&event), ctx->context);
+    arg->cmd = err;
+    arg->flag = (uint64_t)event;
+    debug("create event 0x%lx\n", (uint64_t)event);
+    */
+    
+    for(int i=0; i<CudaEventMapMax; i++) {
+        // debug("i=%d, ctx->cudaEventBitmap[i]=0x%x\n", i, ctx->cudaEventBitmap[i]);
+        pos = ffs(ctx->cudaEventBitmap[i]);
+        if(pos) {
+            pos = i * BITS_PER_WORD + pos;
+            break;
+        }
     }
     if(!pos) {
         error("event number is up to %d\n", CudaEventMaxNum);
         return;
     }
+    __clear_bit(ctx->cudaEventBitmap, pos-1);
     execute_with_context(err = cudaEventCreate(&ctx->cudaEvent[pos-1]), ctx->context);
     arg->cmd = err;
     if (err != cudaSuccess) {
@@ -1620,9 +1641,9 @@ static void cuda_event_create(VirtIOArg *arg, ThreadContext *tctx)
         return;
     }
     arg->flag = (uint64_t)pos;
-    __clear_bit(ctx->cudaEventBitmap, pos-1);
     debug("create event 0x%lx, idx is %u\n",
           (uint64_t)ctx->cudaEvent[pos-1], pos-1);
+    
 }
 
 static void cuda_event_create_with_flags(VirtIOArg *arg, ThreadContext *tctx)
@@ -1631,27 +1652,32 @@ static void cuda_event_create_with_flags(VirtIOArg *arg, ThreadContext *tctx)
     uint32_t pos = 0;
     unsigned int flag=0;
     CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
-    
+
     func();
     init_primary_context(ctx);
+    
     for(int i=0; i<CudaEventMapMax; i++) {
-        pos = ffsll(ctx->cudaEventBitmap[i]);
-        if(pos) break;
+        pos = ffs(ctx->cudaEventBitmap[i]);
+        if(pos) {
+            pos = i * BITS_PER_WORD + pos;
+            break;
+        }
     }
     if(!pos) {
         error("event number is up to %d\n", CudaEventMaxNum);
         return;
     }
+    __clear_bit(ctx->cudaEventBitmap, pos-1);
     flag = arg->flag;
-    // cudaError( (err=cudaEventCreateWithFlags(&ctx->cudaEvent[pos-1], flag) ));
-    execute_with_context( (err=cudaEventCreateWithFlags(&ctx->cudaEvent[pos-1], flag)), ctx->context);
+    execute_with_context((err=cudaEventCreateWithFlags(&ctx->cudaEvent[pos-1], flag)), ctx->context);
+    
+    // execute_with_context( (err=cudaEventCreateWithFlags(&event, flag)), ctx->context);
     arg->cmd = err;
     if (err != cudaSuccess) {
         error("create event with flags error.\n");
         return;
     }
     arg->dst = (uint64_t)pos;
-    __clear_bit(ctx->cudaEventBitmap, pos-1);
     debug("create event 0x%lx with flag %u, idx is %u\n",
           (uint64_t)ctx->cudaEvent[pos-1], flag, pos-1);
 }
@@ -1659,26 +1685,32 @@ static void cuda_event_create_with_flags(VirtIOArg *arg, ThreadContext *tctx)
 static void cuda_event_destroy(VirtIOArg *arg, ThreadContext *tctx)
 {
     cudaError_t err = -1;
-    uint32_t pos = 0;
+    int pos = 0;
     CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
-
+    cudaEvent_t event;
     func();
     init_primary_context(ctx);
-    pos = arg->flag;
+    // event = (cudaEvent_t)arg->flag;
+    // debug("destroy event 0x%lx\n", (uint64_t)event);
+    // execute_with_context( (err=cudaEventDestroy(event)), ctx->context);
+    // arg->cmd = err;
+    
+    pos = (int)arg->flag;
     if (__get_bit(ctx->cudaEventBitmap, pos-1)) {
         error("No such event, pos=%d\n", pos);
         arg->cmd=cudaErrorInvalidValue;
         return;
     }
-    debug("destroy event [pos=%d] 0x%lx\n", pos, (uint64_t)ctx->cudaEvent[pos-1]);
-    // cudaError( (err=cudaEventDestroy(ctx->cudaEvent[pos-1])) );
-    execute_with_context( (err=cudaEventDestroy(ctx->cudaEvent[pos-1])), ctx->context);
+    event = ctx->cudaEvent[pos-1];
+    debug("destroy event [pos=%d] 0x%lx\n", pos, (uint64_t)event);
+    __set_bit(ctx->cudaEventBitmap, pos-1);
+    execute_with_context( (err=cudaEventDestroy(event)), ctx->context);
     arg->cmd = err;
     if (err != cudaSuccess) {
         error("destroy event error.\n");
         return;
     }
-    __set_bit(ctx->cudaEventBitmap, pos-1);
+    
 }
 
 static void cuda_event_query(VirtIOArg *arg, ThreadContext *tctx)
@@ -1686,18 +1718,21 @@ static void cuda_event_query(VirtIOArg *arg, ThreadContext *tctx)
     cudaError_t err = -1;
     uint32_t pos = 0;
     CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
-
+    cudaEvent_t event;
     func();
     init_primary_context(ctx);
+    // event = (cudaEvent_t)arg->flag;
+    
     pos = arg->flag;
     if (__get_bit(ctx->cudaEventBitmap, pos-1)) {
         error("No such event, pos=%d\n", pos);
         arg->cmd=cudaErrorInvalidValue;
         return;
     }
-    debug("query event 0x%lx\n", (uint64_t)ctx->cudaEvent[pos-1]);
+    event = ctx->cudaEvent[pos-1];
+    debug("query event 0x%lx\n", (uint64_t)event);
     cuErrorExit(cuCtxPushCurrent(ctx->context));
-    err=cudaEventQuery(ctx->cudaEvent[pos-1]);
+    err=cudaEventQuery(event);
     cuErrorExit(cuCtxPopCurrent(&ctx->context));
     arg->cmd = err;
 }
@@ -1705,7 +1740,8 @@ static void cuda_event_query(VirtIOArg *arg, ThreadContext *tctx)
 static void cuda_event_record(VirtIOArg *arg, ThreadContext *tctx)
 {
     cudaError_t err = -1;
-    uint64_t epos = 0, spos = 0;
+    uint64_t epos = 0;
+    uint64_t spos = 0;
     cudaStream_t stream;
     cudaEvent_t event;
     CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
@@ -1715,6 +1751,8 @@ static void cuda_event_record(VirtIOArg *arg, ThreadContext *tctx)
     epos = arg->src;
     spos = arg->dst;
     debug("event pos = 0x%lx\n", epos);
+    // event = (cudaEvent_t)arg->src;
+    
     if (epos<=0 || __get_bit(ctx->cudaEventBitmap, epos-1)) {
         error("No such event, pos=0x%lx\n", epos);
         arg->cmd=cudaErrorInvalidResourceHandle;
@@ -1733,7 +1771,6 @@ static void cuda_event_record(VirtIOArg *arg, ThreadContext *tctx)
     }
     debug("record event 0x%lx, stream=0x%lx\n", 
         (uint64_t)event, (uint64_t)stream);
-    // cudaError((err=cudaEventRecord(event, stream)));
     execute_with_context((err=cudaEventRecord(event, stream)), ctx->context);
     arg->cmd = err;
     if (err != cudaSuccess) {
@@ -1746,18 +1783,23 @@ static void cuda_event_synchronize(VirtIOArg *arg, ThreadContext *tctx)
     cudaError_t err = -1;
     uint32_t pos = 0;
     CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
-
+    cudaEvent_t event;
     func();
     init_primary_context(ctx);
+    // event = (cudaEvent_t)arg->flag;
+    // debug("sync event 0x%lx\n", (uint64_t)event);
+    // execute_with_context( (err=cudaEventSynchronize(event)), ctx->context);
+    
     pos = arg->flag;
     if (__get_bit(ctx->cudaEventBitmap, pos-1)) {
         error("No such event, pos=%d\n", pos);
         arg->cmd=cudaErrorInvalidValue;
         return;
     }
-    debug("sync event 0x%lx\n", (uint64_t)ctx->cudaEvent[pos-1]);
-    // cudaError( (err=cudaEventSynchronize(ctx->cudaEvent[pos-1])) );
-    execute_with_context( (err=cudaEventSynchronize(ctx->cudaEvent[pos-1])), ctx->context);
+    event = ctx->cudaEvent[pos-1];
+    debug("sync event 0x%lx\n", (uint64_t)event);
+    execute_with_context( (err=cudaEventSynchronize(event)), ctx->context);
+    
     arg->cmd = err;
     if (err != cudaSuccess) {
         error("synchronize event error.\n");
@@ -1771,11 +1813,15 @@ static void cuda_event_elapsedtime(VirtIOArg *arg, ThreadContext *tctx)
     int start_pos, stop_pos;
     float time = 0;
     CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
+    cudaEvent_t start, stop;
 
     func();
     init_primary_context(ctx);
-    start_pos = arg->src;
-    stop_pos = arg->dst;
+    // start = (cudaEvent_t)arg->src;
+    // stop = (cudaEvent_t)arg->dst;
+    
+    start_pos = (int)arg->src;
+    stop_pos = (int)arg->dst;
     if (__get_bit(ctx->cudaEventBitmap, start_pos-1)) {
         error("No such event, pos=%d\n", start_pos);
         arg->cmd=cudaErrorInvalidValue;
@@ -1786,14 +1832,12 @@ static void cuda_event_elapsedtime(VirtIOArg *arg, ThreadContext *tctx)
         arg->cmd=cudaErrorInvalidValue;
         return;
     }
-    debug("start event 0x%lx\n", (uint64_t)ctx->cudaEvent[start_pos-1]);
-    debug("stop event 0x%lx\n", (uint64_t)ctx->cudaEvent[stop_pos-1]);
-    // cudaError( (err=cudaEventElapsedTime(&time, 
-    //                                      ctx->cudaEvent[start_pos-1], 
-    //                                      ctx->cudaEvent[stop_pos-1])) );
+    start = ctx->cudaEvent[start_pos-1];
+    stop = ctx->cudaEvent[stop_pos-1];
+    debug("start event 0x%lx\n", (uint64_t)start);
+    debug("stop event 0x%lx\n", (uint64_t)stop);
     execute_with_context( (err=cudaEventElapsedTime(&time, 
-                                 ctx->cudaEvent[start_pos-1], 
-                                 ctx->cudaEvent[stop_pos-1])), ctx->context);
+                                 start, stop)), ctx->context);    
     arg->cmd = err;
     if (err != cudaSuccess) {
         error("event calc elapsed time error.\n");
@@ -2764,6 +2808,276 @@ static void cublas_dgemv(VirtIOArg *arg, ThreadContext *tctx)
             alpha, A, lda, x, incx, beta, y, incy);
     arg->cmd = status;
 }
+
+static void curand_create_generator(VirtIOArg *arg, ThreadContext *tctx)
+{
+    curandStatus_t status = -1;
+    curandGenerator_t generator;
+    curandRngType_t rng_type = (curandRngType_t)arg->dst;
+    func();
+    curandCheck(status = curandCreateGenerator(&generator, rng_type));
+    arg->flag = (uint64_t)generator;
+    arg->cmd = status;
+    debug("curand generator 0x%lx\n", (uint64_t)generator);
+}
+
+static void curand_create_generator_host(VirtIOArg *arg, ThreadContext *tctx)
+{
+    curandStatus_t status = -1;
+    curandGenerator_t generator;
+    curandRngType_t rng_type = (curandRngType_t)arg->dst;
+    func();
+    curandCheck(status = curandCreateGeneratorHost(&generator, rng_type));
+    arg->flag = (uint64_t)generator;
+    arg->cmd = status;
+    debug("curand generator 0x%lx\n", (uint64_t)generator);
+}
+
+static void curand_generate(VirtIOArg *arg, ThreadContext *tctx)
+{
+    CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
+    curandStatus_t status = -1;
+    curandGenerator_t generator;
+    unsigned int *ptr;
+    size_t n;
+
+    func();
+    // device address
+    if (arg->flag == 0) {
+        if( (ptr = (unsigned int *)map_device_addr_by_vaddr(arg->dst, &ctx->vol))==NULL) {
+            error("Failed to find virtual addr %p in vol\n", (void *)arg->dst);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    } else if(arg->flag == 1) {
+        if((ptr = (unsigned int *)gpa_to_hva((hwaddr)arg->param2, arg->dstSize))==NULL) {
+            error("No such physical address %p.\n", (void *)arg->param2);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    } else if (arg->flag == 2) {
+        if( (ptr = (unsigned int *)map_host_addr_by_vaddr(arg->dst, &ctx->host_vol))==NULL) {
+            error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    }
+    generator   = (curandGenerator_t)arg->src;
+    n           = (size_t)arg->param;
+    curandCheck(status=curandGenerate(generator, ptr, n));
+    debug("generator=%lx, ptr=%p, n=%ld\n", (uint64_t)generator, ptr, n);
+    arg->cmd = status;
+}
+
+static void curand_generate_normal(VirtIOArg *arg, ThreadContext *tctx)
+{
+    CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
+    curandStatus_t status = -1;
+    curandGenerator_t generator;
+    float *ptr;
+    size_t n;
+    float mean, stddev;
+    uint8_t *buf = NULL;
+    int idx = 0;
+
+    func();
+    if((buf = gpa_to_hva((hwaddr)arg->param, arg->paramSize))==NULL) {
+        error("No such param physical address 0x%lx.\n", arg->param);
+        arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+        return;
+    }
+    // device address
+    if (arg->flag == 0) {
+        if( (ptr = (float *)map_device_addr_by_vaddr(arg->dst, &ctx->vol))==NULL) {
+            error("Failed to find virtual addr %p in vol\n", (void *)arg->dst);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    } else if(arg->flag == 1) {
+        if((ptr = (float *)gpa_to_hva((hwaddr)arg->param2, arg->dstSize))==NULL) {
+            error("No such physical address %p.\n", (void *)arg->param2);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    } else if (arg->flag == 2) {
+        if( (ptr = (float*)map_host_addr_by_vaddr(arg->dst, &ctx->host_vol))==NULL) {
+            error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    }
+    generator   = (curandGenerator_t)arg->src;
+    n           = (size_t)arg->src2;
+    memcpy(&mean, buf+idx, sizeof(float));
+    idx += sizeof(float);
+    memcpy(&stddev, buf+idx, sizeof(float));
+    idx += sizeof(float);
+    assert(idx == arg->paramSize);
+    curandCheck(status=curandGenerateNormal(generator, ptr, n, mean, stddev));
+    debug("generator=%lx, ptr=%p, n=%ld, mean=%g, stddev=%g\n",
+            (uint64_t)generator, ptr, n, mean, stddev);
+    arg->cmd = status;
+}
+
+static void curand_generate_normal_double(VirtIOArg *arg, ThreadContext *tctx)
+{
+    CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
+    curandStatus_t status = -1;
+    curandGenerator_t generator;
+    double *ptr;
+    size_t n;
+    double mean, stddev;
+    uint8_t *buf = NULL;
+    int idx = 0;
+
+    func();
+    if (arg->flag == 0) {
+        if( (ptr = (double *)map_device_addr_by_vaddr(arg->dst, &ctx->vol))==NULL) {
+            error("Failed to find virtual addr %p in vol\n", (void *)arg->dst);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    } else if(arg->flag == 1) {
+        if((ptr = (double *)gpa_to_hva((hwaddr)arg->param2, arg->dstSize))==NULL) {
+            error("No such physical address %p.\n", (void *)arg->param2);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    } else if (arg->flag == 2) {
+        if((ptr = (double *)map_host_addr_by_vaddr(arg->dst, &ctx->host_vol))==NULL) {
+            error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    }
+    if((buf = gpa_to_hva((hwaddr)arg->param, arg->paramSize))==NULL) {
+        error("No such physical address 0x%lx.\n", arg->param);
+        arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+        return;
+    }
+    generator   = (curandGenerator_t)arg->src;
+    n           = (size_t)arg->src2;
+    memcpy(&mean, buf+idx, sizeof(double));
+    idx += sizeof(double);
+    memcpy(&stddev, buf+idx, sizeof(double));
+    idx += sizeof(double);
+    assert(idx == arg->paramSize);
+    curandCheck(status=curandGenerateNormalDouble(generator, ptr, n, mean, stddev));
+    debug("generator=%lx, ptr=%p, n=%ld, mean=%g, stddev=%g\n",
+            (uint64_t)generator, ptr, n, mean, stddev);
+    arg->cmd = status;
+}
+
+static void curand_generate_uniform(VirtIOArg *arg, ThreadContext *tctx)
+{
+    CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
+    curandStatus_t status = -1;
+    curandGenerator_t generator;
+    float *ptr;
+    size_t num;
+    func();
+    generator   = (curandGenerator_t)arg->src;
+    num         = (size_t)arg->param;
+    // device address
+    if (arg->flag == 0) {
+        if( (ptr = (float *)map_device_addr_by_vaddr(arg->dst, &ctx->vol))==NULL) {
+            error("Failed to find virtual addr %p in vol\n", (void *)arg->dst);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    } else if(arg->flag == 1) {
+        if((ptr = (float *)gpa_to_hva((hwaddr)arg->param2, arg->dstSize))==NULL) {
+            error("No such physical address 0x%lx.\n", arg->param2);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    } else if (arg->flag == 2) {
+        if( (ptr = (float*)map_host_addr_by_vaddr(arg->dst, &ctx->host_vol))==NULL) {
+            error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    }
+    curandCheck(status = curandGenerateUniform(generator, ptr, num));
+    arg->cmd = status;
+    debug("curand generator 0x%lx, ptr=%p, num=0x%lx\n", 
+            (uint64_t)generator, ptr, num);
+}
+
+static void curand_generate_uniform_double(VirtIOArg *arg, ThreadContext *tctx)
+{
+    CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
+    curandStatus_t status = -1;
+    curandGenerator_t generator;
+    double *ptr;
+    size_t num;
+    func();
+    generator   = (curandGenerator_t)arg->src;
+    num         = (size_t)arg->param;
+    // device address
+    if (arg->flag == 0) {
+        if( (ptr = (double *)map_device_addr_by_vaddr(arg->dst, &ctx->vol))==NULL) {
+            error("Failed to find virtual addr %p in vol\n", (void *)arg->dst);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    } else if(arg->flag == 1) {
+        if((ptr = (double *)gpa_to_hva((hwaddr)arg->param2, arg->dstSize))==NULL) {
+            error("No such physical address 0x%lx.\n", arg->param2);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    } else if (arg->flag == 2) {
+        if((ptr = (double *)map_host_addr_by_vaddr(arg->dst, &ctx->host_vol))==NULL) {
+            error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    }
+    curandCheck(status = curandGenerateUniformDouble(generator, ptr, num));
+    arg->cmd = status;
+    debug("curand generator 0x%lx, ptr=%p, num=0x%lx\n", 
+            (uint64_t)generator, ptr, num);
+}
+
+static void curand_destroy_generator(VirtIOArg *arg, ThreadContext *tctx)
+{
+    curandStatus_t status = -1;
+    curandGenerator_t generator;
+    func();
+    generator   = (curandGenerator_t)arg->src;
+    curandCheck(status = curandDestroyGenerator(generator));
+    arg->cmd = status;
+    debug("curand destroy generator 0x%lx\n", (uint64_t)generator);
+}
+
+static void curand_set_generator_offset(VirtIOArg *arg, ThreadContext *tctx)
+{
+    curandStatus_t status = -1;
+    curandGenerator_t generator;
+    unsigned long long offset;
+    func();
+    generator   = (curandGenerator_t)arg->src;
+    offset      = (unsigned long long)arg->param;
+    curandCheck(status = curandSetGeneratorOffset(generator, offset));
+    arg->cmd = status;
+    debug("curand set offset generator 0x%lx, offset 0x%llx\n", 
+        (uint64_t)generator, offset);
+}
+
+static void curand_set_pseudorandom_seed(VirtIOArg *arg, ThreadContext *tctx)
+{
+    curandStatus_t status = -1;
+    curandGenerator_t generator;
+    unsigned long long seed;
+    func();
+    generator   = (curandGenerator_t)arg->src;
+    seed      = (unsigned long long)arg->param;
+    curandCheck(status = curandSetPseudoRandomGeneratorSeed(generator, seed));
+    arg->cmd = status;
+    debug("curand set seed generator 0x%lx, seed 0x%llx\n", 
+        (uint64_t)generator, seed);
+}
 /*
 static inline void cpu_physical_memory_read(hwaddr addr,
                                             void *buf, int len)
@@ -3099,6 +3413,36 @@ static void *worker_processor(void *arg)
             case VIRTIO_CUBLAS_DSCAL:
                 cublas_dscal(msg, tctx);
                 break;
+            case VIRTIO_CURAND_CREATEGENERATOR:
+                curand_create_generator(msg, tctx);
+                break;
+            case VIRTIO_CURAND_CREATEGENERATORHOST:
+                curand_create_generator_host(msg, tctx);
+                break;
+            case VIRTIO_CURAND_GENERATE:
+                curand_generate(msg, tctx);
+                break;
+            case VIRTIO_CURAND_GENERATENORMAL:
+                curand_generate_normal(msg, tctx);
+                break;
+            case VIRTIO_CURAND_GENERATENORMALDOUBLE:
+                curand_generate_normal_double(msg, tctx);
+                break;
+            case VIRTIO_CURAND_GENERATEUNIFORM:
+                curand_generate_uniform(msg, tctx);
+                break;
+            case VIRTIO_CURAND_GENERATEUNIFORMDOUBLE:
+                curand_generate_uniform_double(msg, tctx);
+                break;
+            case VIRTIO_CURAND_DESTROYGENERATOR:
+                curand_destroy_generator(msg, tctx);
+                break;
+            case VIRTIO_CURAND_SETGENERATOROFFSET:
+                curand_set_generator_offset(msg, tctx);
+                break;
+            case VIRTIO_CURAND_SETPSEUDORANDOMSEED:
+                curand_set_pseudorandom_seed(msg, tctx);
+                break;
             default:
                 error("[+] header.cmd=%u, nr= %u \n",
                       msg->cmd, _IOC_NR(msg->cmd));
@@ -3202,8 +3546,8 @@ static void init_port(VirtIOSerialPort *port)
     for (int i = 0; i < tctx->deviceCount; i++)
     {
         ctx = &tctx->contexts[i];
-        memset(&ctx->cudaStreamBitmap,   ~0, sizeof(ctx->cudaStreamBitmap));
-        memset(ctx->cudaEventBitmap,     ~0, sizeof(sizeof(word_t)*CudaEventMapMax));
+        memset(&ctx->cudaStreamBitmap,  ~0, sizeof(ctx->cudaStreamBitmap));
+        memset(&ctx->cudaEventBitmap,   ~0, sizeof(ctx->cudaEventBitmap));
         memset(ctx->cudaEvent,           0,  sizeof(cudaEvent_t) *CudaEventMaxNum);
         memset(ctx->cudaStream,          0,  sizeof(cudaStream_t)*CudaStreamMaxNum);
         INIT_LIST_HEAD(&ctx->vol);
