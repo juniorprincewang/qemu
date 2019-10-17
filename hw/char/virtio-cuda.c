@@ -807,10 +807,10 @@ static void cuda_memcpy(VirtIOArg *arg, ThreadContext *tctx)
 
     func();
     init_primary_context(ctx);
-    debug("src=0x%lx, srcSize=0x%x, dst=0x%lx, "
-          "dstSize=0x%x, kind=0x%lx, param=0x%lx\n",
-          arg->src, arg->srcSize, arg->dst, 
-          arg->dstSize, arg->flag, arg->param);
+    debug("tid = %d, src=0x%lx, srcSize=0x%x, dst=0x%lx, "
+          "dstSize=0x%x, kind=0x%lx, param=0x%lx, param2=0x%lx\n",
+          arg->tid,  arg->src, arg->srcSize, arg->dst, 
+          arg->dstSize, arg->flag, arg->param, arg->param2);
     size = arg->srcSize;
     if (arg->flag == cudaMemcpyHostToDevice) {
         // device address
@@ -1195,7 +1195,7 @@ static int set_shm(size_t size, char *file_path)
     int res=0;
     int mmap_fd = shm_open(file_path, O_CREAT|O_RDWR, S_IRUSR|S_IWUSR);
     if (mmap_fd == -1) {
-        error("Failed to open.\n");
+        error("Failed to open with errno %s\n", strerror(errno));
         return 0;
     }
     shm_unlink(file_path);
@@ -1228,6 +1228,8 @@ static void mmapctl(VirtIOArg *arg, VirtIOSerialPort *port)
     snprintf(path, sizeof(path), "/qemu_%lu_%u_%lx", 
             (long)getpid(), port->id, arg->src);
     fd = set_shm(size, path);
+    if(!fd)
+        return;
     if(arg->param) {
         int blocks = arg->param;
         uint64_t *gpa_array = (uint64_t*)gpa_to_hva((hwaddr)arg->dst, blocks);
@@ -1641,8 +1643,8 @@ static void cuda_event_create(VirtIOArg *arg, ThreadContext *tctx)
         return;
     }
     arg->flag = (uint64_t)pos;
-    debug("create event 0x%lx, idx is %u\n",
-          (uint64_t)ctx->cudaEvent[pos-1], pos-1);
+    debug("tid %d create event 0x%lx, pos(arg->flag) is 0x%lx\n",
+          arg->tid, (uint64_t)ctx->cudaEvent[pos-1], arg->flag);
     
 }
 
@@ -1678,8 +1680,8 @@ static void cuda_event_create_with_flags(VirtIOArg *arg, ThreadContext *tctx)
         return;
     }
     arg->dst = (uint64_t)pos;
-    debug("create event 0x%lx with flag %u, idx is %u\n",
-          (uint64_t)ctx->cudaEvent[pos-1], flag, pos-1);
+    debug("create event 0x%lx with flag %u, pos is %u\n",
+          (uint64_t)ctx->cudaEvent[pos-1], flag, pos);
 }
 
 static void cuda_event_destroy(VirtIOArg *arg, ThreadContext *tctx)
@@ -1702,7 +1704,7 @@ static void cuda_event_destroy(VirtIOArg *arg, ThreadContext *tctx)
         return;
     }
     event = ctx->cudaEvent[pos-1];
-    debug("destroy event [pos=%d] 0x%lx\n", pos, (uint64_t)event);
+    debug("tid %d destroy event [pos=%d] 0x%lx\n", arg->tid, pos, (uint64_t)event);
     __set_bit(ctx->cudaEventBitmap, pos-1);
     execute_with_context( (err=cudaEventDestroy(event)), ctx->context);
     arg->cmd = err;
@@ -3448,6 +3450,7 @@ static void *worker_processor(void *arg)
                       msg->cmd, _IOC_NR(msg->cmd));
             return NULL;
         }
+        debug("writing back tid %d\n", msg->tid);
         ret = virtio_serial_write(port, (const uint8_t *)msg, 
                                   sizeof(VirtIOArg));
         if (ret < sizeof(VirtIOArg)) {
