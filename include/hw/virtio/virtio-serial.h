@@ -25,6 +25,7 @@
 #include "cuda_runtime.h"
 #include "chan.h"
 #include "list.h"
+#include "list_sort.h"
 #include <sys/time.h>
 
 #define CudaContextMaxNum   8
@@ -47,19 +48,27 @@ enum{BITS_PER_WORD = sizeof(word_t) * CHAR_BIT}; // BITS_PER_WORD=64
 #define BIT_OFFSET(b) ((b)%BITS_PER_WORD)
 
 typedef struct VirtualObjectList {
-    uint64_t addr;
-    uint64_t v_addr;
+    uint64_t addr;      // device address
+    uint64_t v_addr;    // device virtual address
     int size;
     struct list_head list;
 } VOL;
 
 typedef struct HostVirtualObjectList {
-    uint64_t addr;
-    uint64_t virtual_addr;
+    uint64_t addr;          // host virtual address
+    uint64_t virtual_addr;  // guest virtual address
     size_t size;
     int fd;
     struct list_head list;
 } HVOL;
+
+typedef struct HostPhysicalObjectList {
+    unsigned long haddr;    // host page virtual address
+    unsigned long paddr;    // guest page physical address
+    unsigned long vaddr;    // guest page mapped virtual address
+    size_t offset;    // host offset
+    struct list_head list;
+} HPOL;
 
 typedef struct CudaKernel CudaKernel;
 typedef struct CudaMemVar CudaMemVar;
@@ -126,6 +135,10 @@ struct ThreadContext
     unsigned char   deviceBitmap;
     chan_t          *worker_queue;
     QemuThread      worker_thread;
+    struct list_head    host_pol;
+    int             fd;
+    void            *shm;
+    size_t          size_used;
 };
 
 struct virtio_serial_conf {

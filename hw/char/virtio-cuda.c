@@ -328,7 +328,7 @@ static int __get_bit(word_t *word, int n)
 static void *gpa_to_hva(hwaddr gpa, int len)
 {
     hwaddr size = (hwaddr)len;
-    void *hva = cpu_physical_memory_map(gpa, &size, 0);
+    void *hva = cpu_physical_memory_map(gpa, &size, 1);
     if (!hva || len != size) {
         error("Failed to map MMIO memory for"
                           " gpa 0x%lx element size %u\n",
@@ -594,6 +594,8 @@ static void init_device_module(CudaContext *ctx)
     CudaModule *module = NULL;
     CudaKernel *kernel = NULL;
     CudaMemVar *var = NULL;
+
+    func();
     debug("sub module number = %d\n", ctx->moduleCount);
     for (i=0; i < ctx->moduleCount; i++) {
         module = &ctx->modules[i];
@@ -616,6 +618,7 @@ static void init_device_module(CudaContext *ctx)
 static void init_primary_context(CudaContext *ctx)
 {
     if(!ctx->initialized) {
+        func();
         cuErrorExit(cuDeviceGet(&ctx->dev, ctx->tctx->cur_dev));
         cuErrorExit(cuDevicePrimaryCtxRetain(&ctx->context, ctx->dev));
         cuErrorExit(cuCtxSetCurrent(ctx->context));
@@ -798,6 +801,132 @@ static void remove_hvol_by_vaddr(uint64_t vaddr, struct list_head *header)
     error("Found no memory maped ptr=0x%lx\n", vaddr);
 }
 
+static int set_shm(size_t size, char *file_path)
+{
+    int res=0;
+    int mmap_fd = shm_open(file_path, O_CREAT|O_RDWR, S_IRUSR|S_IWUSR);
+    if (mmap_fd == -1) {
+        error("Failed to open with errno %s\n", strerror(errno));
+        return 0;
+    }
+    shm_unlink(file_path);
+    // extend
+    res = ftruncate(mmap_fd, size);
+    if (res == -1) {
+        error("Failed to ftruncate.\n");
+        return 0;
+    }
+    return mmap_fd;
+}
+
+static HPOL *find_hpol_by_paddr(unsigned long paddr, struct list_head *header)
+{
+    HPOL *hpol;
+    list_for_each_entry(hpol, header, list) {
+        if(hpol->paddr == paddr) {
+            goto out;
+        }
+    }
+    hpol = NULL;
+out:
+    return hpol;
+}
+
+static int cmp(void *priv, struct list_head *a, struct list_head *b)
+{
+    HPOL * pol_a = container_of(a, HPOL, list);
+    HPOL * pol_b = container_of(b, HPOL, list);
+
+    if (pol_a->vaddr > pol_b->vaddr)
+        return 1;
+    return -1;
+}
+
+static void* map_host_phys(size_t blocks, unsigned long paddr_arry, unsigned long vaddr, size_t size, ThreadContext *tctx)
+{
+    CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
+    unsigned long dst;
+    unsigned long shm;
+    int start_idx = 0;
+    void *addr  = NULL;
+    void *ptr   = NULL;
+    int i=0;
+    size_t page_sz = 1UL<<PAGE_SHIFT;
+    size_t len = 0;
+    size_t offset=0;
+    HPOL *hpol, *hpol_prev, *hpol_next;
+    uint64_t page_mask;
+
+    func();
+    if(blocks <= 0 || size <= 0 || paddr_arry == 0 || vaddr == 0)
+        return NULL;
+    hwaddr *gpa_array = (hwaddr*)gpa_to_hva((hwaddr)paddr_arry, blocks*sizeof(unsigned long));
+    if(!gpa_array) {
+        error("Failed to get gpa_array.\n");
+        return NULL;
+    }
+    page_mask = ~(BIT(PAGE_SHIFT) - 1);
+    shm = (unsigned long)tctx->shm;
+    if((hpol = find_hpol_by_paddr(gpa_array[0], &tctx->host_pol))!=NULL) {
+        debug("Found page 0x%lx in list\n", gpa_array[0]);
+        dst     = shm + hpol->offset;
+        debug("already mapped addr: start 0x%lx\n", dst);
+        offset  = hpol->offset + page_sz;
+        len     = page_sz * (blocks-1);
+        if(blocks > 1) {    // move page_array if nr_pages are more than 1
+            hpol_prev = list_prev_entry(hpol, list);
+            hpol_next = list_next_entry(hpol, list);
+            debug("hpol prev is 0x%lx, next is 0x%lx\n", hpol_prev->paddr, hpol_next->paddr);
+            list_for_each_entry(hpol, &tctx->host_pol, list) {
+                if(hpol->offset >= offset) {
+                    ptr = gpa_to_hva(hpol->paddr, page_sz);
+                    memcpy((void*)(shm+hpol->offset+len), ptr, page_sz);
+                    munmap(ptr, page_sz);
+                    addr = mmap(ptr, page_sz, PROT_READ | PROT_WRITE, MAP_SHARED|MAP_FIXED, tctx->fd, hpol->offset+len);
+                    assert(addr != MAP_FAILED);
+                    hpol->offset  += len;
+                    hpol->haddr  = shm + hpol->offset;
+                    debug("again addr 0x%lx is mapped to 0x%lx\n", hpol->paddr, hpol->haddr);
+                }
+            }
+        }
+        start_idx = 1;
+        tctx->size_used += len;
+    } else {
+        offset      = tctx->size_used;
+        dst         = shm + offset;
+        start_idx   = 0;
+        tctx->size_used += page_sz * blocks;
+    }
+    for(i=start_idx; i<blocks; i++) {
+        ptr = gpa_to_hva(gpa_array[i], page_sz);
+        memcpy((void*)(shm+offset), ptr, page_sz);
+        munmap(ptr, page_sz);
+        addr = mmap(ptr, page_sz, PROT_READ | PROT_WRITE, MAP_SHARED|MAP_FIXED, tctx->fd, offset);
+        assert(addr != MAP_FAILED);
+        hpol  = (HPOL *)malloc(sizeof(HPOL));
+        hpol->paddr     = gpa_array[i];
+        hpol->haddr     = shm + offset;
+        hpol->vaddr     = vaddr & page_mask ;
+        hpol->offset  = offset;
+        list_add_tail(&hpol->list, &tctx->host_pol);
+        offset+=page_sz;
+        debug("addr%d 0x%lx is mapped to 0x%lx\n", i, gpa_array[i], hpol->haddr);
+    }
+    list_sort(NULL, &tctx->host_pol, cmp);
+    list_for_each_entry(hpol, &tctx->host_pol, list) {
+        debug("page virtual addr 0x%lx, offset 0x%lx\n", hpol->vaddr, hpol->offset);
+    }
+    debug("In total: 0x%lx is mapped to 0x%lx\n", vaddr, dst);
+    debug("offset 0x%lx\n", vaddr & (~page_mask));
+    HVOL *hvol          = (HVOL *)malloc(sizeof(HVOL));
+    hvol->addr          = dst + (vaddr & (~page_mask));
+    hvol->virtual_addr  = vaddr;
+    hvol->size          = size;
+    list_add_tail(&hvol->list, &ctx->host_vol);
+    return (void*)hvol->addr;
+}
+
 static void cuda_memcpy(VirtIOArg *arg, ThreadContext *tctx)
 {
     cudaError_t err;
@@ -821,9 +950,11 @@ static void cuda_memcpy(VirtIOArg *arg, ThreadContext *tctx)
         }
         if(arg->param) {
             if( (src = (void*)map_host_addr_by_vaddr(arg->src, &ctx->host_vol))==NULL) {
-                error("Failed to find virtual addr %p in host vol\n", (void *)arg->src);
-                arg->cmd = cudaErrorInvalidValue;
-                return;
+                if( (src = (void*)map_host_phys(arg->param, arg->param2, arg->src, size, tctx))==NULL) {
+                    error("Failed to find virtual addr %p in vol\n", (void *)arg->dst);
+                    arg->cmd = cudaErrorInvalidValue;
+                    return;
+                }
             }
         } else {
             if((src= gpa_to_hva((hwaddr)arg->param2, size)) == NULL) {
@@ -841,16 +972,18 @@ static void cuda_memcpy(VirtIOArg *arg, ThreadContext *tctx)
         return;
     } else if (arg->flag == cudaMemcpyDeviceToHost) {
         // get device address
-        if( (src = (void*)map_device_addr_by_vaddr(arg->src, &ctx->vol))==0) {
+        if( (src = (void*)map_device_addr_by_vaddr(arg->src, &ctx->vol))==NULL) {
             error("Failed to find virtual addr %p in vol\n", (void *)arg->src);
             arg->cmd = cudaErrorInvalidValue;
             return;
         }
         if(arg->param) {
-            if( (dst = (void*)map_host_addr_by_vaddr(arg->dst, &ctx->host_vol))==0) {
-                error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
-                arg->cmd = cudaErrorInvalidValue;
-                return;
+            if( (dst = (void*)map_host_addr_by_vaddr(arg->dst, &ctx->host_vol))==NULL) {
+                if( (dst  = (void*)map_host_phys(arg->param, arg->param2, arg->dst, size, tctx))==NULL) {
+                    error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+                    arg->cmd = cudaErrorInvalidValue;
+                    return;
+                }
             }
         } else {
             if((dst= gpa_to_hva((hwaddr)arg->param2, size)) == NULL) {
@@ -929,9 +1062,11 @@ static void cuda_memcpy_async(VirtIOArg *arg, ThreadContext *tctx)
         }
         if(arg->param) {
             if( (src = (void*)map_host_addr_by_vaddr(arg->src, &ctx->host_vol))==NULL) {
-                error("Failed to find virtual addr %p in host vol\n", (void *)arg->src);
-                arg->cmd = cudaErrorInvalidValue;
-                return;
+                if( (src  = (void*)map_host_phys(arg->param, arg->param2, arg->src, size, tctx))==NULL) {
+                    error("Failed to find virtual addr %p in host vol\n", (void *)arg->src);
+                    arg->cmd = cudaErrorInvalidValue;
+                    return;
+                }
             }
         } else {
             if((src= gpa_to_hva((hwaddr)arg->param2, size)) == NULL) {
@@ -958,9 +1093,11 @@ static void cuda_memcpy_async(VirtIOArg *arg, ThreadContext *tctx)
         }
         if(arg->param) {
             if( (dst = (void*)map_host_addr_by_vaddr(arg->dst, &ctx->host_vol))==0) {
-                error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
-                arg->cmd = cudaErrorInvalidValue;
-                return;
+                if( (dst  = (void*)map_host_phys(arg->param, arg->param2, arg->dst, size, tctx))==NULL) {
+                    error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+                    arg->cmd = cudaErrorInvalidValue;
+                    return;
+                }
             }
         } else {
             if((dst= gpa_to_hva((hwaddr)arg->param2, size)) == NULL) {
@@ -1026,9 +1163,9 @@ static void cuda_memcpy_to_symbol(VirtIOArg *arg, ThreadContext *tctx)
     
     func();
     init_primary_context(ctx);
-    debug("src=0x%lx, srcSize=0x%x, dst=0x%lx, dstSize=0x%x, kind=%lu, "
+    debug("src=0x%lx, srcSize=0x%x, dst=0x%lx, dstSize=0x%x, src2=%lu, "
         "param=0x%lx, param2=0x%lx \n",
-        arg->src, arg->srcSize, arg->dst, arg->dstSize, arg->flag, 
+        arg->src, arg->srcSize, arg->dst, arg->dstSize, arg->src2, 
         arg->param, arg->param2);
     var_handle = (size_t)arg->dst;
     m_num = ctx->moduleCount;
@@ -1050,11 +1187,13 @@ static void cuda_memcpy_to_symbol(VirtIOArg *arg, ThreadContext *tctx)
     }
 
     size = arg->srcSize;
-    if (arg->flag != 0) {
+    if (arg->param != 0) {
         if((src = (void*)map_host_addr_by_vaddr(arg->src, &ctx->host_vol))==NULL) {
-            error("Failed to find virtual addr %p in host vol\n", (void *)arg->src);
-            arg->cmd = cudaErrorInvalidValue;
-            return;
+            if( (src  = (void*)map_host_phys(arg->param, arg->param2, arg->src, size, tctx))==NULL) {
+                error("Failed to find virtual addr %p in host vol\n", (void *)arg->src);
+                arg->cmd = cudaErrorInvalidValue;
+                return;
+            }
         }
     } else {
         if((src= gpa_to_hva((hwaddr)arg->param2, size)) == NULL) {
@@ -1063,7 +1202,7 @@ static void cuda_memcpy_to_symbol(VirtIOArg *arg, ThreadContext *tctx)
             return;
         }
     }
-    var_offset = (size_t)arg->param;
+    var_offset = (size_t)arg->src2;
     dst = (void *)(var->device_ptr+var_offset);
     execute_with_context(err=cudaMemcpy(dst, src, size, cudaMemcpyHostToDevice), ctx->context);
     arg->cmd = err;
@@ -1090,9 +1229,9 @@ static void cuda_memcpy_from_symbol(VirtIOArg *arg, ThreadContext *tctx)
 
     func();
     init_primary_context(ctx);
-    debug(  "src=0x%lx, srcSize=0x%x, dst=0x%lx, dstSize=0x%x, kind=0x%lx, "
+    debug(  "src=0x%lx, srcSize=0x%x, dst=0x%lx, dstSize=0x%x, src2=0x%lx, "
             "param=0x%lx, param2=0x%lx,\n",
-            arg->src, arg->srcSize, arg->dst, arg->dstSize, arg->flag, 
+            arg->src, arg->srcSize, arg->dst, arg->dstSize, arg->src2, 
             arg->param, arg->param2);
  
     var_handle = (size_t)arg->src;
@@ -1114,13 +1253,15 @@ static void cuda_memcpy_from_symbol(VirtIOArg *arg, ThreadContext *tctx)
         return;
     }
     size = arg->dstSize;
-    var_offset = (size_t)arg->param;
+    var_offset = (size_t)arg->src2;
     src = (void*)(var->device_ptr+var_offset);
-    if (arg->flag != 0) {
+    if (arg->param != 0) {
         if((dst = (void*)map_host_addr_by_vaddr(arg->dst, &ctx->host_vol))==NULL) {
-            error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
-            arg->cmd = cudaErrorInvalidValue;
-            return;
+            if( (dst  = (void*)map_host_phys(arg->param, arg->param2, arg->dst, size, tctx))==NULL) {
+                error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+                arg->cmd = cudaErrorInvalidValue;
+                return;
+            }
         }
     } else {
         if((dst= gpa_to_hva((hwaddr)arg->param2, size)) == NULL) {
@@ -1188,24 +1329,6 @@ static void cuda_malloc(VirtIOArg *arg, ThreadContext *tctx)
     list_add_tail(&vol->list, &ctx->vol);
     debug("actual devPtr=0x%lx, virtual ptr=0x%lx, size=0x%lx,"
           "ret value=0x%x\n", (uint64_t)devPtr, arg->dst, size, err);
-}
-
-static int set_shm(size_t size, char *file_path)
-{
-    int res=0;
-    int mmap_fd = shm_open(file_path, O_CREAT|O_RDWR, S_IRUSR|S_IWUSR);
-    if (mmap_fd == -1) {
-        error("Failed to open with errno %s\n", strerror(errno));
-        return 0;
-    }
-    shm_unlink(file_path);
-    // extend
-    res = ftruncate(mmap_fd, size);
-    if (res == -1) {
-        error("Failed to ftruncate.\n");
-        return 0;
-    }
-    return mmap_fd;
 }
 
 static void mmapctl(VirtIOArg *arg, VirtIOSerialPort *port)
@@ -1345,27 +1468,29 @@ static void cuda_host_register(VirtIOArg *arg, VirtIOSerialPort *port)
     func();
     init_primary_context(ctx);
     debug("src=0x%lx, srcSize=0x%x, dst=0x%lx, "
-          "dstSize=0x%x, kind=0x%lx, param=0x%lx\n",
+          "dstSize=0x%x, kind=0x%lx, param=0x%lx, param2=0x%lx\n",
           arg->src, arg->srcSize, arg->dst, 
-          arg->dstSize, arg->flag, arg->param);
+          arg->dstSize, arg->flag, arg->param, arg->param2);
 
     size = arg->srcSize;
     flags = (unsigned int)arg->flag;
     // get host address
     if(arg->param) {
         if((ptr = (void*)map_host_addr_by_vaddr(arg->src, &ctx->host_vol))==NULL) {
-            error("Failed to find virtual addr %p in host vol\n", (void *)arg->src);
-            arg->cmd = cudaErrorInvalidValue;
-            return;
+            if( (ptr = (void*)map_host_phys(arg->param, arg->param2, arg->src, size, tctx))==NULL) {
+                error("Failed to find virtual addr %p in host vol\n", (void *)arg->src);
+                arg->cmd = cudaErrorInvalidValue;
+                return;
+            }
         }
     } else {
-        if((ptr= gpa_to_hva((hwaddr)arg->dst, size)) == NULL) {
-            error("No such physical address 0x%lx.\n", arg->dst);
+        if((ptr= gpa_to_hva((hwaddr)arg->param2, size)) == NULL) {
+            error("No such physical address 0x%lx.\n", arg->param2);
             arg->cmd = cudaErrorInvalidValue;
             return;
         }
     }
-    debug("ptr = %p\n", ptr);
+    debug("ptr = %p, size=0x%lx\n", ptr, size);
     execute_with_context((err = cudaHostRegister(ptr, size, flags)), ctx->context);
     arg->cmd = err;
     if (err != cudaSuccess) {
@@ -1384,24 +1509,27 @@ static void cuda_host_unregister(VirtIOArg *arg, VirtIOSerialPort *port)
     func();
     init_primary_context(ctx);
     debug("src=0x%lx, srcSize=0x%x, dst=0x%lx, "
-          "dstSize=0x%x, kind=0x%lx, param=0x%lx\n",
+          "dstSize=0x%x, kind=0x%lx, param=0x%lx, param2=0x%lx\n",
           arg->src, arg->srcSize, arg->dst, 
-          arg->dstSize, arg->flag, arg->param);
+          arg->dstSize, arg->flag, arg->param, arg->param2);
     size = arg->srcSize;
     // get host address
     if(arg->param) {
         if((ptr = (void*)map_host_addr_by_vaddr(arg->src, &ctx->host_vol))==NULL) {
-            error("Failed to find virtual addr %p in host vol\n", (void *)arg->src);
-            arg->cmd = cudaErrorInvalidValue;
-            return;
+            if( (ptr = (void *)map_host_phys(arg->param, arg->param2, arg->src, size, tctx))==NULL) {
+                error("Failed to find virtual addr %p in host vol\n", (void *)arg->src);
+                arg->cmd = cudaErrorInvalidValue;
+                return;
+            }
         }
     } else {
-        if((ptr= gpa_to_hva((hwaddr)arg->dst, size)) == NULL) {
-            error("No such physical address 0x%lx.\n", arg->dst);
+        if((ptr= gpa_to_hva((hwaddr)arg->param2, size)) == NULL) {
+            error("No such physical address 0x%lx.\n", arg->param2);
             arg->cmd = cudaErrorInvalidValue;
             return;
         }
     }
+    debug("ptr is %p\n", ptr);
     execute_with_context((err = cudaHostUnregister(ptr)), ctx->context);
     arg->cmd = err;
     if (err != cudaSuccess) {
@@ -1956,19 +2084,21 @@ static void cublas_set_vector(VirtIOArg *arg, ThreadContext *tctx)
     size = arg->srcSize;
     if(arg->flag) {
         if( (src = (void*)map_host_addr_by_vaddr(arg->src, &ctx->host_vol))==NULL) {
-            error("Failed to find virtual addr %p in host vol\n", (void *)arg->src);
-            arg->cmd = CUBLAS_STATUS_MAPPING_ERROR;
-            return;
+            if( (src  = (void *)map_host_phys(arg->param, arg->param2, arg->src, size, tctx))==NULL) {
+                error("Failed to find virtual addr %p in host vol\n", (void *)arg->src);
+                arg->cmd = CUBLAS_STATUS_MAPPING_ERROR;
+                return;
+            }
         }
     } else {
-        if((src= gpa_to_hva((hwaddr)arg->src, size)) == NULL) {
-            error("No such physical address 0x%lx.\n", arg->src);
+        if((src= gpa_to_hva((hwaddr)arg->param2, size)) == NULL) {
+            error("No such physical address 0x%lx.\n", arg->param2);
             arg->cmd = CUBLAS_STATUS_MAPPING_ERROR;
             return;
         }
     }
-    if((buf = gpa_to_hva((hwaddr)arg->param, arg->paramSize))==NULL) {
-        error("No such physical address 0x%lx.\n", arg->param);
+    if((buf = gpa_to_hva((hwaddr)arg->src2, arg->srcSize2))==NULL) {
+        error("No such physical address 0x%lx.\n", arg->src2);
         arg->cmd = CUBLAS_STATUS_MAPPING_ERROR;
         return;
     }
@@ -2008,9 +2138,11 @@ static void cublas_get_vector(VirtIOArg *arg, ThreadContext *tctx)
     size = arg->srcSize;
     if(arg->flag) {
         if( (dst = (void*)map_host_addr_by_vaddr(arg->param2, &ctx->host_vol))==NULL) {
-            error("Failed to find virtual addr %p in host vol\n", (void *)arg->param2);
-            arg->cmd = CUBLAS_STATUS_MAPPING_ERROR;
-            return;
+            if( (dst  = (void *)map_host_phys(arg->param, arg->param2, arg->dst, size, tctx))==NULL) {
+                error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+                arg->cmd = CUBLAS_STATUS_MAPPING_ERROR;
+                return;
+            }
         }
     } else {
         if((dst= gpa_to_hva((hwaddr)arg->param2, size)) == NULL) {
@@ -2019,8 +2151,8 @@ static void cublas_get_vector(VirtIOArg *arg, ThreadContext *tctx)
             return;
         }
     }
-    if((buf = gpa_to_hva((hwaddr)arg->param, arg->paramSize))==NULL) {
-        error("No such physical address 0x%lx.\n", arg->param);
+    if((buf = gpa_to_hva((hwaddr)arg->src2, arg->srcSize2))==NULL) {
+        error("No such physical address 0x%lx.\n", arg->src2);
         arg->cmd = CUBLAS_STATUS_MAPPING_ERROR;
         return;
     }
@@ -2060,9 +2192,11 @@ static void cublas_set_matrix(VirtIOArg *arg, ThreadContext *tctx)
     size = arg->srcSize;
     if(arg->flag) {
         if( (src = (void*)map_host_addr_by_vaddr(arg->src, &ctx->host_vol))==NULL) {
-            error("Failed to find virtual addr %p in host vol\n", (void *)arg->src);
-            arg->cmd = CUBLAS_STATUS_MAPPING_ERROR;
-            return;
+            if( (src  = (void *)map_host_phys(arg->param, arg->param2, arg->src, size, tctx))==NULL) {
+                error("Failed to find virtual addr %p in host vol\n", (void *)arg->src);
+                arg->cmd = CUBLAS_STATUS_MAPPING_ERROR;
+                return;
+            }
         }
     } else {
         if((src= gpa_to_hva((hwaddr)arg->src, size)) == NULL) {
@@ -2071,8 +2205,8 @@ static void cublas_set_matrix(VirtIOArg *arg, ThreadContext *tctx)
             return;
         }
     }
-    if((buf = gpa_to_hva((hwaddr)arg->param, arg->paramSize))==NULL) {
-        error("No such physical address 0x%lx.\n", arg->param);
+    if((buf = gpa_to_hva((hwaddr)arg->src2, arg->srcSize2))==NULL) {
+        error("No such physical address 0x%lx.\n", arg->src2);
         arg->cmd = CUBLAS_STATUS_MAPPING_ERROR;
         return;
     }
@@ -2114,9 +2248,11 @@ static void cublas_get_matrix(VirtIOArg *arg, ThreadContext *tctx)
     size = arg->srcSize;
     if(arg->flag) {
         if( (dst = (void*)map_host_addr_by_vaddr(arg->param2, &ctx->host_vol))==NULL) {
-            error("Failed to find virtual addr %p in host vol\n", (void *)arg->param2);
-            arg->cmd = CUBLAS_STATUS_MAPPING_ERROR;
-            return;
+            if( (dst  = (void *)map_host_phys(arg->param, arg->param2, arg->dst, size, tctx))==NULL) {
+                error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+                arg->cmd = CUBLAS_STATUS_MAPPING_ERROR;
+                return;
+            }
         }
     } else {
         if((dst= gpa_to_hva((hwaddr)arg->param2, size)) == NULL) {
@@ -2125,8 +2261,8 @@ static void cublas_get_matrix(VirtIOArg *arg, ThreadContext *tctx)
             return;
         }
     }
-    if((buf = gpa_to_hva((hwaddr)arg->param, arg->paramSize))==NULL) {
-        error("No such physical address 0x%lx.\n", arg->param);
+    if((buf = gpa_to_hva((hwaddr)arg->src2, arg->srcSize2))==NULL) {
+        error("No such physical address 0x%lx.\n", arg->src2);
         arg->cmd = CUBLAS_STATUS_MAPPING_ERROR;
         return;
     }
@@ -2863,9 +2999,15 @@ static void curand_generate(VirtIOArg *arg, ThreadContext *tctx)
             arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
             return;
         }
+    } else if (arg->flag == 3) {
+        if( (ptr  = (unsigned int *)map_host_phys(arg->param, arg->param2, arg->dst, arg->dstSize, tctx))==NULL) {
+            error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
     }
     generator   = (curandGenerator_t)arg->src;
-    n           = (size_t)arg->param;
+    n           = (size_t)arg->src2;
     curandCheck(status=curandGenerate(generator, ptr, n));
     debug("generator=%lx, ptr=%p, n=%ld\n", (uint64_t)generator, ptr, n);
     arg->cmd = status;
@@ -2883,8 +3025,8 @@ static void curand_generate_normal(VirtIOArg *arg, ThreadContext *tctx)
     int idx = 0;
 
     func();
-    if((buf = gpa_to_hva((hwaddr)arg->param, arg->paramSize))==NULL) {
-        error("No such param physical address 0x%lx.\n", arg->param);
+    if((buf = gpa_to_hva((hwaddr)arg->src2, arg->paramSize))==NULL) {
+        error("No such param physical address 0x%lx.\n", arg->src2);
         arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
         return;
     }
@@ -2907,9 +3049,15 @@ static void curand_generate_normal(VirtIOArg *arg, ThreadContext *tctx)
             arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
             return;
         }
+    } else if (arg->flag == 3) {
+        if( (ptr  = (float *)map_host_phys(arg->param, arg->param2, arg->dst, arg->dstSize, tctx))==NULL) {
+            error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
     }
     generator   = (curandGenerator_t)arg->src;
-    n           = (size_t)arg->src2;
+    n           = (size_t)arg->srcSize;
     memcpy(&mean, buf+idx, sizeof(float));
     idx += sizeof(float);
     memcpy(&stddev, buf+idx, sizeof(float));
@@ -2951,14 +3099,20 @@ static void curand_generate_normal_double(VirtIOArg *arg, ThreadContext *tctx)
             arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
             return;
         }
+    } else if (arg->flag == 3) {
+        if( (ptr  = (double *)map_host_phys(arg->param, arg->param2, arg->dst, arg->dstSize, tctx))==NULL) {
+            error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
     }
-    if((buf = gpa_to_hva((hwaddr)arg->param, arg->paramSize))==NULL) {
-        error("No such physical address 0x%lx.\n", arg->param);
+    if((buf = gpa_to_hva((hwaddr)arg->src2, arg->paramSize))==NULL) {
+        error("No such physical address 0x%lx.\n", arg->src2);
         arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
         return;
     }
     generator   = (curandGenerator_t)arg->src;
-    n           = (size_t)arg->src2;
+    n           = (size_t)arg->srcSize;
     memcpy(&mean, buf+idx, sizeof(double));
     idx += sizeof(double);
     memcpy(&stddev, buf+idx, sizeof(double));
@@ -2979,7 +3133,7 @@ static void curand_generate_uniform(VirtIOArg *arg, ThreadContext *tctx)
     size_t num;
     func();
     generator   = (curandGenerator_t)arg->src;
-    num         = (size_t)arg->param;
+    num         = (size_t)arg->src2;
     // device address
     if (arg->flag == 0) {
         if( (ptr = (float *)map_device_addr_by_vaddr(arg->dst, &ctx->vol))==NULL) {
@@ -2995,6 +3149,12 @@ static void curand_generate_uniform(VirtIOArg *arg, ThreadContext *tctx)
         }
     } else if (arg->flag == 2) {
         if( (ptr = (float*)map_host_addr_by_vaddr(arg->dst, &ctx->host_vol))==NULL) {
+            error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    } else if (arg->flag == 3) {
+        if( (ptr  = (float *)map_host_phys(arg->param, arg->param2, arg->dst, arg->dstSize, tctx))==NULL) {
             error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
             arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
             return;
@@ -3015,7 +3175,7 @@ static void curand_generate_uniform_double(VirtIOArg *arg, ThreadContext *tctx)
     size_t num;
     func();
     generator   = (curandGenerator_t)arg->src;
-    num         = (size_t)arg->param;
+    num         = (size_t)arg->src2;
     // device address
     if (arg->flag == 0) {
         if( (ptr = (double *)map_device_addr_by_vaddr(arg->dst, &ctx->vol))==NULL) {
@@ -3031,6 +3191,12 @@ static void curand_generate_uniform_double(VirtIOArg *arg, ThreadContext *tctx)
         }
     } else if (arg->flag == 2) {
         if((ptr = (double *)map_host_addr_by_vaddr(arg->dst, &ctx->host_vol))==NULL) {
+            error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
+            arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
+            return;
+        }
+    } else if (arg->flag == 3) {
+        if( (ptr  = (double *)map_host_phys(arg->param, arg->param2, arg->dst, arg->dstSize, tctx))==NULL) {
             error("Failed to find virtual addr %p in host vol\n", (void *)arg->dst);
             arg->cmd = CURAND_STATUS_ALLOCATION_FAILED;
             return;
@@ -3126,6 +3292,7 @@ static void unload_module(ThreadContext *tctx)
     int i=0, idx=0;
     CudaContext *ctx = NULL;
     CudaModule *mod = NULL;
+    HVOL *hvol, *hvol2;
 
     func();
     for (idx = 0; idx < tctx->deviceCount; idx++) {
@@ -3150,6 +3317,10 @@ static void unload_module(ThreadContext *tctx)
                 cuErrorExit(cuDevicePrimaryCtxRelease(ctx->dev));
                 deinit_primary_context(ctx);
             }
+            list_for_each_entry_safe(hvol, hvol2, &ctx->host_vol, list) {
+                list_del(&hvol->list);
+                free(hvol);
+            }
         }
     }
 }
@@ -3157,6 +3328,7 @@ static void unload_module(ThreadContext *tctx)
 /* Callback function that's called when the guest opens/closes the port */
 static void set_guest_connected(VirtIOSerialPort *port, int guest_connected)
 {
+    HPOL *hpol, *hpol2;
     func();
     DeviceState *dev = DEVICE(port);
     // VirtIOSerial *vser = VIRTIO_CUDA(dev);
@@ -3175,6 +3347,10 @@ static void set_guest_connected(VirtIOSerialPort *port, int guest_connected)
             tctx->deviceCount   = total_device;
             tctx->cur_dev       = DEFAULT_DEVICE;
             memset(&tctx->deviceBitmap, 0, sizeof(tctx->deviceBitmap));
+        }
+        list_for_each_entry_safe(hpol, hpol2, &tctx->host_pol, list) {
+            list_del(&hpol->list);
+            free(hpol);
         }
         gettimeofday(&port->end_time, NULL);
         // double time_spent = (double)(port->end_time.tv_usec - port->start_time.tv_usec)/1000000 +
@@ -3541,6 +3717,8 @@ static void init_port(VirtIOSerialPort *port)
     ThreadContext *tctx = NULL;
     port->thread_context = malloc(sizeof(ThreadContext));
     CudaContext *ctx = NULL;
+    char path[128];
+
     tctx = port->thread_context;
     tctx->deviceCount = total_device;
     tctx->cur_dev = DEFAULT_DEVICE;
@@ -3560,6 +3738,17 @@ static void init_port(VirtIOSerialPort *port)
         ctx->tctx        = tctx;
     }
     tctx->worker_queue  = chan_init(100);
+    INIT_LIST_HEAD(&tctx->host_pol);
+    snprintf(path, sizeof(path), "/qemu_%lu_%x", 
+                (long)getpid(), port->id);
+    tctx->fd = set_shm(SHM_SIZE, path);
+    if(!tctx->fd) {
+        error("Failed to create shm file.\n");
+    }
+    tctx->shm = mmap(0, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, tctx->fd, 0);
+    assert(tctx->shm != MAP_FAILED);
+    // cudaError(cudaHostRegister(tctx->shm, SHM_SIZE, cudaHostRegisterDefault));
+    tctx->size_used = 0;
 }
 
 static void deinit_port(VirtIOSerialPort *port)
@@ -3568,6 +3757,9 @@ static void deinit_port(VirtIOSerialPort *port)
     /*delete elements in struct list_head*/
     /*
     */
+    // cudaError(cudaHostUnregister(tctx->shm));
+    munmap(tctx->shm, SHM_SIZE);
+    close(tctx->fd);
     free(tctx->contexts);
     tctx->contexts = NULL;
     chan_dispose(tctx->worker_queue);
