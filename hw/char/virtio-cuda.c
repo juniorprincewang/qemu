@@ -779,9 +779,14 @@ static uint64_t map_device_addr_by_vaddr(uint64_t vaddr, struct list_head *heade
 
 static uint64_t map_host_addr_by_vaddr(uint64_t vaddr, struct list_head *header)
 {
+    unsigned long haddr;
+    uint64_t page_mask;
     HVOL *hvol = find_hvol_by_vaddr(vaddr, header);
-    if(hvol != NULL)
-        return hvol->addr + (vaddr - hvol->virtual_addr);
+    if(hvol != NULL) {
+        page_mask = ~(BIT(PAGE_SHIFT) - 1);
+        haddr = hvol->pol->haddr + (hvol->virtual_addr & (~page_mask));
+        return haddr + (vaddr - hvol->virtual_addr);
+    }
     return 0;
 }
 
@@ -845,17 +850,15 @@ static int cmp(void *priv, struct list_head *a, struct list_head *b)
 static void* map_host_phys(size_t blocks, unsigned long paddr_arry, unsigned long vaddr, size_t size, ThreadContext *tctx)
 {
     CudaContext *ctx = &tctx->contexts[tctx->cur_dev];
-    unsigned long dst;
     unsigned long shm;
-    int start_idx = 0;
     void *addr  = NULL;
     void *ptr   = NULL;
     int i=0;
     size_t page_sz = 1UL<<PAGE_SHIFT;
-    size_t len = 0;
     size_t offset=0;
-    HPOL *hpol, *hpol_prev, *hpol_next;
+    HPOL *hpol, *pol_dst;
     uint64_t page_mask;
+    int found = 0;
 
     func();
     if(blocks <= 0 || size <= 0 || paddr_arry == 0 || vaddr == 0)
@@ -867,38 +870,15 @@ static void* map_host_phys(size_t blocks, unsigned long paddr_arry, unsigned lon
     }
     page_mask = ~(BIT(PAGE_SHIFT) - 1);
     shm = (unsigned long)tctx->shm;
-    if((hpol = find_hpol_by_paddr(gpa_array[0], &tctx->host_pol))!=NULL) {
-        debug("Found page 0x%lx in list\n", gpa_array[0]);
-        dst     = shm + hpol->offset;
-        debug("already mapped addr: start 0x%lx\n", dst);
-        offset  = hpol->offset + page_sz;
-        len     = page_sz * (blocks-1);
-        if(blocks > 1) {    // move page_array if nr_pages are more than 1
-            hpol_prev = list_prev_entry(hpol, list);
-            hpol_next = list_next_entry(hpol, list);
-            debug("hpol prev is 0x%lx, next is 0x%lx\n", hpol_prev->paddr, hpol_next->paddr);
-            list_for_each_entry(hpol, &tctx->host_pol, list) {
-                if(hpol->offset >= offset) {
-                    ptr = gpa_to_hva(hpol->paddr, page_sz);
-                    memcpy((void*)(shm+hpol->offset+len), ptr, page_sz);
-                    munmap(ptr, page_sz);
-                    addr = mmap(ptr, page_sz, PROT_READ | PROT_WRITE, MAP_SHARED|MAP_FIXED, tctx->fd, hpol->offset+len);
-                    assert(addr != MAP_FAILED);
-                    hpol->offset  += len;
-                    hpol->haddr  = shm + hpol->offset;
-                    debug("again addr 0x%lx is mapped to 0x%lx\n", hpol->paddr, hpol->haddr);
-                }
-            }
+    offset      = tctx->size_used;
+    found = 0;
+    debug("shm used 0x%lx\n", offset);
+    for(i=0; i<blocks; i++) {
+        if((hpol = find_hpol_by_paddr(gpa_array[i], &tctx->host_pol))!=NULL) {
+            debug("Found ppage 0x%lx in list\n", gpa_array[i]);
+            found = 1;
+            continue;
         }
-        start_idx = 1;
-        tctx->size_used += len;
-    } else {
-        offset      = tctx->size_used;
-        dst         = shm + offset;
-        start_idx   = 0;
-        tctx->size_used += page_sz * blocks;
-    }
-    for(i=start_idx; i<blocks; i++) {
         ptr = gpa_to_hva(gpa_array[i], page_sz);
         memcpy((void*)(shm+offset), ptr, page_sz);
         munmap(ptr, page_sz);
@@ -907,23 +887,42 @@ static void* map_host_phys(size_t blocks, unsigned long paddr_arry, unsigned lon
         hpol  = (HPOL *)malloc(sizeof(HPOL));
         hpol->paddr     = gpa_array[i];
         hpol->haddr     = shm + offset;
-        hpol->vaddr     = vaddr & page_mask ;
+        hpol->vaddr     = (vaddr & page_mask) + i*page_sz ;
         hpol->offset  = offset;
         list_add_tail(&hpol->list, &tctx->host_pol);
         offset+=page_sz;
-        debug("addr%d 0x%lx is mapped to 0x%lx\n", i, gpa_array[i], hpol->haddr);
+        debug("paddr%d 0x%lx is mapped to 0x%lx\n", i, gpa_array[i], hpol->haddr);
     }
-    list_sort(NULL, &tctx->host_pol, cmp);
+    if(!found)
+        list_sort(NULL, &tctx->host_pol, cmp);
+    // remmap 
+    offset = 0;
     list_for_each_entry(hpol, &tctx->host_pol, list) {
         debug("page virtual addr 0x%lx, offset 0x%lx\n", hpol->vaddr, hpol->offset);
+        if(hpol->offset != offset) {
+            ptr = gpa_to_hva(hpol->paddr, page_sz);
+            memcpy((void*)(shm + offset), ptr, page_sz);
+            munmap(ptr, page_sz);
+            addr = mmap(ptr, page_sz, PROT_READ | PROT_WRITE, MAP_SHARED|MAP_FIXED, tctx->fd, offset);
+            assert(addr != MAP_FAILED);
+            hpol->offset    = offset;
+            hpol->haddr     = shm + offset;
+            debug("again paddr 0x%lx is mapped to 0x%lx\n", hpol->paddr, hpol->haddr);
+        }
+        offset += page_sz;
+        if(gpa_array[0] == hpol->paddr) {
+            pol_dst = hpol;
+        }
     }
-    debug("In total: 0x%lx is mapped to 0x%lx\n", vaddr, dst);
+    tctx->size_used = offset;
     debug("offset 0x%lx\n", vaddr & (~page_mask));
     HVOL *hvol          = (HVOL *)malloc(sizeof(HVOL));
-    hvol->addr          = dst + (vaddr & (~page_mask));
+    hvol->addr          = pol_dst->haddr + (vaddr & (~page_mask));
     hvol->virtual_addr  = vaddr;
     hvol->size          = size;
+    hvol->pol           = pol_dst;
     list_add_tail(&hvol->list, &ctx->host_vol);
+    debug("In total: virtual 0x%lx is mapped to virtual 0x%lx\n", vaddr, hvol->addr);
     return (void*)hvol->addr;
 }
 
@@ -3329,6 +3328,11 @@ static void unload_module(ThreadContext *tctx)
 static void set_guest_connected(VirtIOSerialPort *port, int guest_connected)
 {
     HPOL *hpol, *hpol2;
+    // void *ptr;
+    // size_t page_sz = 1UL<<PAGE_SHIFT;
+    char path[128];
+    ThreadContext *tctx = port->thread_context;
+
     func();
     DeviceState *dev = DEVICE(port);
     // VirtIOSerial *vser = VIRTIO_CUDA(dev);
@@ -3340,17 +3344,29 @@ static void set_guest_connected(VirtIOSerialPort *port, int guest_connected)
     }
     if(guest_connected) {
         gettimeofday(&port->start_time, NULL);
+        snprintf(path, sizeof(path), "/qemu_%lu_%x", 
+                (long)getpid(), port->id);
+        tctx->fd = set_shm(SHM_SIZE, path);
+        if(!tctx->fd) {
+            error("Failed to create shm file.\n");
+        }
+        tctx->shm = mmap(0, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, tctx->fd, 0);
+        assert(tctx->shm != MAP_FAILED);
+        tctx->size_used = 0;
     } else {
-        ThreadContext *tctx = port->thread_context;
+        list_for_each_entry_safe(hpol, hpol2, &tctx->host_pol, list) {
+            // ptr = gpa_to_hva(hpol->paddr, page_sz);
+            // munmap(ptr, page_sz);
+            list_del(&hpol->list);
+            free(hpol);
+        }
+        munmap(tctx->shm, SHM_SIZE);
+        close(tctx->fd);
         unload_module(tctx);
         if (tctx->deviceBitmap != 0) {
             tctx->deviceCount   = total_device;
             tctx->cur_dev       = DEFAULT_DEVICE;
             memset(&tctx->deviceBitmap, 0, sizeof(tctx->deviceBitmap));
-        }
-        list_for_each_entry_safe(hpol, hpol2, &tctx->host_pol, list) {
-            list_del(&hpol->list);
-            free(hpol);
         }
         gettimeofday(&port->end_time, NULL);
         // double time_spent = (double)(port->end_time.tv_usec - port->start_time.tv_usec)/1000000 +
@@ -3717,7 +3733,6 @@ static void init_port(VirtIOSerialPort *port)
     ThreadContext *tctx = NULL;
     port->thread_context = malloc(sizeof(ThreadContext));
     CudaContext *ctx = NULL;
-    char path[128];
 
     tctx = port->thread_context;
     tctx->deviceCount = total_device;
@@ -3739,14 +3754,14 @@ static void init_port(VirtIOSerialPort *port)
     }
     tctx->worker_queue  = chan_init(100);
     INIT_LIST_HEAD(&tctx->host_pol);
-    snprintf(path, sizeof(path), "/qemu_%lu_%x", 
-                (long)getpid(), port->id);
-    tctx->fd = set_shm(SHM_SIZE, path);
-    if(!tctx->fd) {
-        error("Failed to create shm file.\n");
-    }
-    tctx->shm = mmap(0, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, tctx->fd, 0);
-    assert(tctx->shm != MAP_FAILED);
+    // snprintf(path, sizeof(path), "/qemu_%lu_%x", 
+    //             (long)getpid(), port->id);
+    // tctx->fd = set_shm(SHM_SIZE, path);
+    // if(!tctx->fd) {
+    //     error("Failed to create shm file.\n");
+    // }
+    // tctx->shm = mmap(0, SHM_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, tctx->fd, 0);
+    // assert(tctx->shm != MAP_FAILED);
     // cudaError(cudaHostRegister(tctx->shm, SHM_SIZE, cudaHostRegisterDefault));
     tctx->size_used = 0;
 }
@@ -3758,8 +3773,8 @@ static void deinit_port(VirtIOSerialPort *port)
     /*
     */
     // cudaError(cudaHostUnregister(tctx->shm));
-    munmap(tctx->shm, SHM_SIZE);
-    close(tctx->fd);
+    // munmap(tctx->shm, SHM_SIZE);
+    // close(tctx->fd);
     free(tctx->contexts);
     tctx->contexts = NULL;
     chan_dispose(tctx->worker_queue);

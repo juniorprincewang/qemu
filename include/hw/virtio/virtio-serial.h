@@ -47,6 +47,14 @@ enum{BITS_PER_WORD = sizeof(word_t) * CHAR_BIT}; // BITS_PER_WORD=64
 #define WORD_OFFSET(b) ((b)/BITS_PER_WORD)
 #define BIT_OFFSET(b) ((b)%BITS_PER_WORD)
 
+typedef struct HostPhysicalObjectList {
+    unsigned long haddr;    // host page virtual address
+    unsigned long paddr;    // guest page physical address
+    unsigned long vaddr;    // guest page mapped virtual address
+    size_t offset;    // host offset
+    struct list_head list;
+} HPOL;
+
 typedef struct VirtualObjectList {
     uint64_t addr;      // device address
     uint64_t v_addr;    // device virtual address
@@ -60,15 +68,9 @@ typedef struct HostVirtualObjectList {
     size_t size;
     int fd;
     struct list_head list;
+    HPOL *pol;
 } HVOL;
 
-typedef struct HostPhysicalObjectList {
-    unsigned long haddr;    // host page virtual address
-    unsigned long paddr;    // guest page physical address
-    unsigned long vaddr;    // guest page mapped virtual address
-    size_t offset;    // host offset
-    struct list_head list;
-} HPOL;
 
 typedef struct CudaKernel CudaKernel;
 typedef struct CudaMemVar CudaMemVar;
